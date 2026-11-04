@@ -38,7 +38,7 @@ UEFI 运行时，后台常驻一个 USB Fastboot 服务（设备名 `SunUEFI-pia
 
 ### 同一个 UEFI 核心
 
-项目只维护一份 UEFI 核心 `PianoUEFI-product.img`。合体 BOOT、`fastboot boot` 临时启动和安装器用的都是它，不再按功能拆成多套测试镜像。只想试运行、不改动平板时，下载 `SunUEFI-UEFI-Fastboot`，见[临时启动](docs/user/temporary-boot.md)。
+项目只维护一份 UEFI 核心 `PianoUEFI-product.img`。合体 BOOT、`fastboot boot` 临时启动和安装器用的都是它，不再按功能拆成多套测试镜像。只想试运行、不改动平板时，可以用本地构建的镜像[临时启动](docs/user/temporary-boot.md)。
 
 ## 实机画面
 
@@ -107,10 +107,10 @@ UEFI 运行时，后台常驻一个 USB Fastboot 服务（设备名 `SunUEFI-pia
 > [!NOTE]
 > 需要 Bootloader 已解锁、已安装 KernelSU 或 SukiSU 的小米平板 8 Pro，并提前备份数据。
 
-1. 从 [Build products](https://github.com/slwyts/Project-SunUEFI/actions/workflows/build-products.yml) 下载三个包：引导助手模块（`SunUEFI-Module`）、启动镜像（ESP，`SunUEFI-ESP`）和系统镜像（root，`SunUEFI-Root-发行版`）。
+1. 从 [Build products](https://github.com/slwyts/Project-SunUEFI/actions/workflows/build-products.yml) 下载 `SunUEFI-Module` 引导助手模块，按[构建手册](docs/devel/building.md)准备匹配版本的启动镜像（ESP）和系统镜像（root）。
 2. 在模块管理器里安装模块并重启，点击模块卡片上的 **打开 WebUI**，打开引导助手。
 3. 在 **存储** 页点 **创建独立分区**，选好容量后确认并重启。已有独立分区时跳过这一步。
-4. 在 **存储** 页选择下载好的启动镜像和系统镜像，点 **安装所选镜像**。
+4. 在 **存储** 页选择准备好的启动镜像和系统镜像，点 **安装所选镜像**。
 5. 在 **启动** 页选择 **UEFI** 和 **Linux**，点 **保存并重启**。
 
 > [!WARNING]

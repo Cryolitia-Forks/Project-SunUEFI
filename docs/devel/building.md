@@ -1,6 +1,6 @@
 # 构建手册
 
-在电脑或 CI 上用 `./build.sh` 构建 UEFI 镜像、Android 引导助手和各发行版的系统镜像。所有构建都只在本机和容器里进行，不会向连接的平板写入。
+在电脑上用 `./build.sh` 构建 UEFI 镜像、Android 引导助手和各发行版的系统镜像。CI 构建 UEFI 核心并打包 Android 引导助手模块。所有构建都只在本机和容器里进行，不会向连接的平板写入。
 
 ## 环境要求
 
@@ -9,7 +9,7 @@
 | UEFI 镜像、Android 引导助手模块 | x86_64 或 ARM64 的 Linux，装有 Docker | 普通容器 |
 | 完整系统镜像（Debian GNOME / KDE、Nyarch GNOME、SteamOS） | ARM64 的 Linux，装有 Docker | `--privileged`，用于 chroot 和挂载 |
 
-GitHub Actions 的 `uefi` 和 `linux` 目标在 x86_64 runner 上构建，四个发行版目标在 ARM64 runner 上构建。
+GitHub Actions 在 x86_64 runner 上构建 UEFI 和 Android 模块；完整系统镜像在本地 ARM64 构建机上生成。
 
 ## 取得源码和主机检查
 
@@ -44,7 +44,7 @@ docker run --rm -v "$PWD:/workspace" -w /workspace sunuefi-builder bash -euc '
 '
 ```
 
-`./build.sh uefi` 使用 `vendor/piano` 的板级输入和 `patches/firmware`，输出 `artifacts/product/PianoUEFI-product.img` 和 `manifest.json`。完整 UEFI 构建还需要本地提取的原厂材料，见[本地输入](local-inputs.md)。
+`./build.sh uefi` 使用 `vendor/piano` 的板级输入和 `patches/firmware`，输出 `artifacts/product/PianoUEFI-product.img` 和 `manifest.json`。原厂板级材料已内置在 `vendor/piano`，构建时校验，来源和文件说明见[本地输入](local-inputs.md)。
 
 `./build.sh module` 读取刚构建的产品，编译前置选择器和六个静态 ARM64 工具，生成 `artifacts/android/SunUEFI-Piano-版本.zip`、`manifest.json` 和 `SHA256SUMS`。它不需要平板、原厂 BOOT 或私有采集目录，Android 内核在模块安装时从设备当前 BOOT 提取。默认从经过签名校验的 Debian ARM64 软件包准备编译用的 sysroot，不执行其中的 ARM64 程序。输入和安装行为见 [Android 引导助手](boot/android-module.md)。
 
@@ -92,7 +92,7 @@ python3 tools/package_sparse_images.py --bundle artifacts/release --output artif
 
 基础根系统已经构建过时，用 `./build.sh release-rootfs --resume` 更新内核、硬件包和配置，不重新运行 debootstrap。`./build.sh rootfs --distro ID --desktop ID --plan` 会列出其他发行版和桌面组合的计划，目前只有上表的四个目标能完整构建。
 
-本地和 GitHub 的完整构建走同一个 `release-rootfs` 入口。默认系统包含中文界面、拼音输入法、Chromium、GNOME 动画、蓝牙地址自动初始化和触控笔组件。根系统生成后会检查这些软件包和必需文件，结果记录在 `manifest.json` 的 `default_system`，缺少任何一项构建就失败。
+完整构建走 `release-rootfs` 入口。默认系统包含中文界面、拼音输入法、Chromium、GNOME 动画、蓝牙地址自动初始化和触控笔组件。根系统生成后会检查这些软件包和必需文件，结果记录在 `manifest.json` 的 `default_system`，缺少任何一项构建就失败。
 
 ### Nyarch GNOME 和 SteamOS
 
@@ -132,17 +132,16 @@ CPU 型号由 `linux/dts/piano-cpu-model.dtso` 给八个 CPU 节点加标准 `mo
 
 ## CI 下载
 
-GitHub Actions 的 **Build products** 在 `main` 上有相关改动时自动运行，也可以手动选择 `all`、`uefi`、`linux` 或任一发行版。只改文档不会触发构建，唯一的例外是 `docs/user/install-from-artifact.md`，改动它会触发整套产品构建。选择规则在 `tools/ci_build_targets.py`。
+GitHub Actions 的 [Build products](https://github.com/slwyts/Project-SunUEFI/actions/workflows/build-products.yml) 在 `main` 上有 UEFI 或 Android 模块构建输入变动时自动运行。手动构建时，打开 **Actions → Build products → Run workflow**，选择分支后运行，无需选择构建目标。只改文档不会触发构建。
+
+工作流先执行 `./build.sh uefi`，再通过 `./build.sh module` 把同一份核心打包为 Android 引导助手模块。Linux 内核、启动镜像（ESP）和系统镜像（root）按本页对应目标在本地构建。
 
 | 下载名称 | 内容 |
 | --- | --- |
-| `SunUEFI-Module` | Android 引导助手模块 ZIP |
-| `SunUEFI-UEFI-Fastboot` | 用于 `fastboot boot` 的独立 UEFI 镜像 |
-| `SunUEFI-ESP` | 各发行版共用的稀疏 ESP 镜像 |
-| `SunUEFI-Root-发行版` | 对应发行版的稀疏 root 镜像，发行版为 `debian-gnome`、`debian-kde`、`nyarch-gnome`、`steamos` |
-| `logs` | 合并的构建日志、来源清单和校验记录 |
+| `SunUEFI-Module` | `SunUEFI-Piano-版本.zip` 和 `SHA256SUMS` |
+| `logs` | UEFI 和模块构建日志、来源清单和校验记录 |
 
-模块、UEFI 镜像和 ESP 每次只上传一份，root 镜像按发行版分别上传。安装时把所选发行版的 root 镜像和同一次构建的 ESP 配套使用，步骤见[安装指南](../user/install-from-artifact.md)。
+安装完整系统时，模块和镜像使用同一源码版本，所选发行版的 root 镜像和 ESP 从同一次构建取得，步骤见[安装指南](../user/install-from-artifact.md)。独立 UEFI 镜像可在本地构建后用于[临时启动](../user/temporary-boot.md)。
 
 ## 安装器
 

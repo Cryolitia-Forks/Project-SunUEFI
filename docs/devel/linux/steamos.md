@@ -14,9 +14,9 @@ Proton/FEX 的兼容性仍按游戏区分，不能据此认为所有 Windows 游
 | **原神官方启动器** | **魔法少女的魔女审判** |
 | ![原神官方启动器](../../assets/gallery/steamos-genshin-launcher.webp) | ![魔法少女的魔女审判剧情画面](../../assets/gallery/steamos-witch-trial.webp) |
 
-## 下载与安装
+## 安装
 
-在 GitHub Actions 的 **Build products → Run workflow** 中选择 `steamos`。构建完成后下载 `SunUEFI-Module`、`SunUEFI-ESP` 和 `SunUEFI-Root-steamos`。ESP 与其他发行版共用。助手里的安装顺序与 Debian 相同：创建独立存储分区，选择 ESP 和 root 镜像，刷写并启动。
+从 [CI 下载](../building.md#ci-下载)取得引导助手模块，按[下文步骤](#构建)在本地构建匹配版本的 SteamOS 启动镜像（ESP）和系统镜像（root）。ESP 与其他发行版共用。助手里的安装顺序与 Debian 相同：创建独立存储分区，选择 ESP 和 root 镜像，刷写并启动。
 
 root 镜像容量为 16 GiB，独立 root 分区至少需要相同容量。账户为 `piano`，密码为 `piano123456`。首次启动 Steam 需要联网检查客户端更新并登录。
 
@@ -56,7 +56,7 @@ GPU 渲染节点与显示控制器分别探测。Gamescope 自动选择显示设
 
 ## 构建
 
-使用项目的 ARM64 Debian 构建容器，安装 `requirements-build.txt`，并以 root 和私有挂载命名空间运行。与 CI 相同的步骤：
+使用项目的 ARM64 Debian 构建容器，安装 `requirements-build.txt`，并以 root 和私有挂载命名空间运行：
 
 ```sh
 ./build.sh sources
@@ -102,7 +102,7 @@ ARM64 包构建和包管理命令使用独立的进程命名空间；命令退�
 因 `/dev` 仍被占用而退出，该退出路径已修正。后台进程退出后还会移除
 `/etc/pacman.d/gnupg/S.*` 中残留的 Unix 套接字，保留密钥和信任数据；
 否则所有包构建成功后，最终镜像扫描仍会拒绝 `S.gpg-agent` 特殊文件。
-本地已有包缓存、补装依赖或手工打包的成功结果不能替代 CI 的完整装配与打包。
+本地已有包缓存、补装依赖或手工打包的成功结果不能替代从干净环境开始的完整装配与打包。
 
 每个 pacman 包先用 `makepkg --verifysource` 下载源码并校验配方中的摘要。
 失败后分别等待 15 秒和 30 秒，最多尝试三次；持续失败即停止，不替换源码或

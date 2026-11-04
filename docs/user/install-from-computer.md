@@ -9,7 +9,7 @@
 
 * 平板已解锁 Bootloader，并且用引导助手创建过独立分区，也就是已有 `sunuefi_esp` 和 `sunuefi_root`。没有的话先在助手的 **存储** 页点 **创建独立分区**。
 * 电脑装有 Android platform-tools（`adb` 和 `fastboot`），并有一根 USB-C 数据线。
-* 从同一次 [Build products](https://github.com/slwyts/Project-SunUEFI/actions/workflows/build-products.yml) 下载 `SunUEFI-ESP` 和所需的 `SunUEFI-Root-发行版`，解压得到 `esp.sparse.img` 和 `root-发行版.sparse.img`。它们是 Android 稀疏镜像，只能用原厂 Fastboot 刷写，不能直接用 `dd`。
+* 按[构建手册](https://github.com/slwyts/Project-SunUEFI/blob/main/docs/devel/building.md)准备同一次构建生成的稀疏镜像：`artifacts/fastboot-sparse/esp.img` 和 `artifacts/fastboot-sparse/root.ext4.img`。把两个文件复制到当前终端目录。它们是 Android 稀疏镜像，只能用原厂 Fastboot 刷写，不能直接用 `dd`。
 
 ## 刷写
 
@@ -20,11 +20,11 @@
    fastboot devices
    ```
 
-2. 把下面命令里的 `SERIAL` 换成上一步看到的序列号，root 文件名换成下载的发行版：
+2. 把下面命令里的 `SERIAL` 换成上一步看到的序列号：
 
    ```sh
-   fastboot -s SERIAL -S 128M flash sunuefi_root root-debian-gnome.sparse.img
-   fastboot -s SERIAL -S 128M flash sunuefi_esp esp.sparse.img
+   fastboot -s SERIAL -S 128M flash sunuefi_root root.ext4.img
+   fastboot -s SERIAL -S 128M flash sunuefi_esp esp.img
    fastboot -s SERIAL reboot
    ```
 
