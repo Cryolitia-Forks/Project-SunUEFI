@@ -242,7 +242,7 @@ case "${1:-}" in
   plan)
     operation=${2:-}; value=${3:-}
     case "$operation" in
-      create|resize) case "$value" in 32|64|128|256) ;; *) echo '请选择 32、64、128 或 256 GiB。' >&2; exit 2 ;; esac ;;
+      create|resize) case "$value" in 32|64|128|256|512) ;; *) echo '请选择 32、64、128、256 或 512 GiB。' >&2; exit 2 ;; esac ;;
       flash|delete|delete-return) value=0 ;;
       *) echo '不支持此存储操作。' >&2; exit 2 ;;
     esac
