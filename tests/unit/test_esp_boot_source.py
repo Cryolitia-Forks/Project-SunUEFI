@@ -25,7 +25,8 @@ class EspBootSourceTests(unittest.TestCase):
             subprocess.run([str(exe)], check=True,
                            env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=1'})
         flags[1] = '-I' + str(inc / 'AArch64')
-        subprocess.run([str(ROOT / 'build/host-tools/usr/bin/clang'), '--target=aarch64-windows-msvc',
+        toolroot = Path(os.environ.get('SUNUEFI_TOOLCHAIN_ROOT', ROOT / 'build/host-tools/usr'))
+        subprocess.run([str(toolroot / 'bin/clang'), '--target=aarch64-windows-msvc',
                         '-ffreestanding', '-fshort-wchar', '-fsyntax-only', '-Wall', '-Wextra', '-Werror',
                         *flags, *map(str, sources)], check=True)
 

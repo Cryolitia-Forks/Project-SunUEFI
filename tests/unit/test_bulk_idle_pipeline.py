@@ -1,6 +1,9 @@
 from pathlib import Path
-import os,re,subprocess,tempfile,unittest
-ROOT=Path(__file__).resolve().parents[2];BASE=ROOT/'upstream/Mu-Silicium/Mu_Basecore'
+import os,re,subprocess,sys,tempfile,unittest
+ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT/'tools'))
+from firmware_workspace import active_root
+BASE=active_root(ROOT)/'upstream/Mu-Silicium/Mu_Basecore'
 def function(text,name):
  match=re.search(r'(?m)^(?:STATIC )?EFI_STATUS\s+(?:EFIAPI\s+)?'+name+r'\s*\(',text)
  if not match:raise ValueError(name)
@@ -11,7 +14,7 @@ def function(text,name):
 class BulkIdlePipelineTests(unittest.TestCase):
  def test_actual_wait_policy_client_and_device(self):
   policy=(ROOT/'uefi/core/PianoBootPolicy.c').read_text();event=(BASE/'MdeModulePkg/Core/Dxe/Event/Event.c').read_text()
-  actual='\n\n'.join([function(policy,'ReadIdle'),function(policy,'Pump'),function(event,'CoreWaitForEvent')])
+  actual='\n\n'.join([function(policy,'ReadIdle'),function(policy,'StartupUsbAbsent'),function(policy,'Pump'),function(event,'CoreWaitForEvent')])
   inc=BASE/'MdePkg/Include';other=[BASE/'CryptoPkg/Include',ROOT/'upstream/Mu-Silicium/Silicon/Qualcomm/QcomPkg/Include']
   with tempfile.TemporaryDirectory(prefix='bulk-idle-pipeline-')as directory:
    directory=Path(directory);(directory/'PianoActualBulkIdlePipeline.h').write_text(actual);exe=directory/'pipeline'

@@ -27,7 +27,8 @@ class ProductBootLogTests(unittest.TestCase):
                 capture_output=True, text=True, env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=1'})
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             print(run.stdout.strip())
-        subprocess.run([str(ROOT / 'build/host-tools/usr/bin/clang'),
+        toolroot = Path(os.environ.get('SUNUEFI_TOOLCHAIN_ROOT', ROOT / 'build/host-tools/usr'))
+        subprocess.run([str(toolroot / 'bin/clang'),
             '--target=aarch64-windows-msvc', '-ffreestanding', '-fshort-wchar',
             '-fsyntax-only', '-Wall', '-Wextra', '-Werror', '-I' + str(INC),
             '-I' + str(INC / 'AArch64'),'-I'+str(generated),str(SOURCE)], check=True)

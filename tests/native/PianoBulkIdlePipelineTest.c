@@ -5,13 +5,17 @@
 #include "PianoUsbServiceTest.c"
 #undef USB_SERVICE_TEST_MAIN
 #include "../../uefi/core/PianoBootPolicy.h"
+#include "../../uefi/components/nv/PianoNvFile.h"
 #include <Library/PianoProductPumpLib.h>
+#include <Library/TimerLib.h>
 EFI_SYSTEM_TABLE *gST;static EFI_SYSTEM_TABLE system_table;
 static PIANO_BOOT_POLICY_REPORT mReport;
 static PIANO_PRODUCT_RUNTIME_PROTOCOL mRuntime;
 static PIANO_PRODUCT_IDLE_PROTOCOL mIdle;
+static CONST PIANO_SMMU_RETIRED_USB_PROOF *mStartupUsbProof;
+static CONST VOID *mStartupUsbFdt;
 static BOOLEAN mAlive=TRUE,wait_ready;
-static UINTN wait_checks,idles;
+static UINTN wait_checks,idles,nv_saves;
 #define gEfiCurrentTpl current_tpl
 EFI_EVENT gIdleLoopEvent=(VOID*)9;
 static UINT64 Critical(VOID){return 0;}static VOID EndCritical(UINT64 Mask){(VOID)Mask;}
@@ -19,6 +23,15 @@ static EFI_STATUS Exact(EFI_STATUS S){return S==EFI_SUCCESS?S:EFI_ERROR(S)?S:EFI
 static VOID RequireAlive(VOID){assert(mAlive);}
 static EFI_STATUS AtApp(VOID){return current_tpl==TPL_APPLICATION?EFI_SUCCESS:EFI_UNSUPPORTED;}
 static EFI_STATUS RefreshKeys(VOID){return EFI_SUCCESS;}
+// Diagnostics and NV storage are outside the real wait/USB pipeline under test.
+VOID PianoRawLinuxReplayStable(VOID){assert(current_tpl==TPL_APPLICATION&&mReport.Pumping);}
+UINT64 EFIAPI GetPerformanceCounter(VOID){return fake_now;}
+UINT64 EFIAPI GetTimeInNanoSecond(UINT64 Ticks){return Ticks*1000;}
+EFI_STATUS PianoNvFileSave(BOOLEAN Freeze){
+ assert(!Freeze&&current_tpl==TPL_APPLICATION&&mReport.IdleKnown&&
+   !mReport.IdleBulkActive&&!mService.State.BulkActive&&!mService.State.WorkPending);
+ ++nv_saves;return EFI_NOT_STARTED;
+}
 static EFI_STATUS EFIAPI Request(PIANO_PRODUCT_RUNTIME_PROTOCOL *This,UINT32 Action){(VOID)This;(VOID)Action;assert(!"no navigation expected in bulk fixture");return EFI_ACCESS_DENIED;}
 static EFI_STATUS EFIAPI PendingIdle(PIANO_PRODUCT_RUNTIME_PROTOCOL *This,UINT32 *Action,UINT64 *Sequence){assert(This==&mRuntime);*Action=PIANO_PRODUCT_ACTION_NONE;*Sequence=1;return EFI_SUCCESS;}
 static EFI_STATUS EFIAPI AckIdle(PIANO_PRODUCT_RUNTIME_PROTOCOL *This,UINT64 Sequence){(VOID)This;(VOID)Sequence;assert(!"wait never acknowledges");return EFI_ACCESS_DENIED;}
@@ -39,6 +52,7 @@ int main(VOID){
  assert(mPending[3]&&mService.State.BulkActive&&!mService.Count);bs.LocateProtocol=IdleLocate;bs.Hdr.Signature=EFI_BOOT_SERVICES_SIGNATURE;system_table.BootServices=&bs;gST=&system_table;
  mReport.Initialized=mReport.ProtocolInstalled=mReport.IdleInstalled=TRUE;mRuntime=(PIANO_PRODUCT_RUNTIME_PROTOCOL){1,Pump,AliveIdle,Request,PendingIdle,AckIdle};mIdle=(PIANO_PRODUCT_IDLE_PROTOCOL){1,&mRuntime,ReadIdle};
  EFI_EVENT Event=(VOID*)1;UINTN Index=99;assert(CoreWaitForEvent(1,&Event,&Index)==EFI_SUCCESS&&Index==0&&wait_checks==3&&idles==1&&mReport.PumpCalls==3);
+ assert(nv_saves>0);
  assert(PianoProductPumpLibDestructor(NULL,NULL)==EFI_SUCCESS);PIANO_USB_SERVICE_RETIRE_REPORT R;assert(PianoUsbControllerServiceStop(EFI_SUCCESS,&R)==EFI_SUCCESS&&R.Clean);free_cold_model();
  puts("Actual wait/policy/idle-client/device pipeline: inflight empty queue stays awake, completion restores idle, timer submits no commands, full stop clean");return 0;
 }
