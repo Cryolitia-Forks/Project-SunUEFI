@@ -12,6 +12,9 @@ on:
       build_denial:
         required: true
         type: boolean
+      module_only:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -308,16 +311,22 @@ jobs:
             ./build.sh repo products --verify-kernel-abi artifacts/packages/kernel \
             2>&1 | tee build/logs/kernel-repository.log
       - name: Pass the verified shared build to this run
+        if: '!inputs.module_only'
         uses: ./.github/actions/build-input
         with:
           operation: upload
           name: ${{ matrix.kind }}
           paths: ${{ matrix.kind == 'firmware' && env.FIRMWARE_INPUTS || env.KERNEL_INPUTS }}
+      - name: Verify the Android module checksum
+        if: matrix.kind == 'firmware'
+        working-directory: artifacts/android
+        run: sha256sum -c SHA256SUMS
       - name: Stage the shared firmware downloads
         if: matrix.kind == 'firmware'
         run: |
           mkdir -p artifacts/downloads/module artifacts/downloads/uefi
-          cp artifacts/android/SunUEFI-Piano-*.zip artifacts/downloads/module/
+          cp artifacts/android/SunUEFI-Piano-*.zip artifacts/android/SHA256SUMS artifacts/downloads/module/
+          if [ "${{ inputs.module_only }}" = true ]; then exit 0; fi
           cp artifacts/product/PianoUEFI-product.img artifacts/downloads/uefi/SunUEFI-UEFI-Fastboot.img
           cp uefi/components/product-support/Library/ConsoleScale/OFL.txt artifacts/downloads/uefi/
       - name: Android assistant module
@@ -330,7 +339,7 @@ jobs:
           retention-days: 7
           compression-level: 0
       - name: UEFI for fastboot boot
-        if: matrix.kind == 'firmware'
+        if: matrix.kind == 'firmware' && !inputs.module_only
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: SunUEFI-UEFI-Fastboot
