@@ -1,0 +1,19 @@
+{
+  "git.autoRepositoryDetection": "subFolders",
+  "git.detectSubmodules": false,
+  "git.repositoryScanIgnoredFolders": [
+    "node_modules",
+    "build",
+    "artifacts",
+    "private",
+    ".venv",
+    "upstream"
+  ],
+  "files.watcherExclude": {
+    "**/build/**": true,
+    "**/artifacts/**": true,
+    "**/private/**": true,
+    "**/.venv/**": true,
+    "**/upstream/**": true
+  }
+}
