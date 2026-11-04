@@ -6,15 +6,15 @@
 
 平板已解锁 Bootloader，并安装了 KernelSU 或 SukiSU，重要数据已备份。官方 Magisk 需要 MMRL 等支持 WebUI 的管理器。
 
-从 [Build products](https://github.com/slwyts/Project-SunUEFI/actions/workflows/build-products.yml) 同一次完整构建里下载三个包：
+从 [Build products](https://github.com/slwyts/Project-SunUEFI/actions/workflows/build-products.yml) 下载并解压 `SunUEFI-Module`，按[构建手册](../devel/building.md)在本地生成匹配版本的启动镜像和系统镜像。安装需要三个文件：
 
-| 下载包 | 解压后使用的文件 | 用途 |
-| --- | --- | --- |
-| `SunUEFI-Module` | `SunUEFI-Piano-版本.zip` | 引导助手模块 |
-| `SunUEFI-ESP` | `esp.sparse.img` | 启动镜像（ESP） |
-| `SunUEFI-Root-发行版` | `root-发行版.sparse.img` | 系统镜像（root） |
+| 构建产物 | 用途 |
+| --- | --- |
+| `SunUEFI-Piano-版本.zip` | 引导助手模块 |
+| `artifacts/fastboot-sparse/esp.img` | 启动镜像（ESP） |
+| `artifacts/fastboot-sparse/root.ext4.img` | 系统镜像（root） |
 
-发行版可选 `debian-gnome`、`debian-kde`、`nyarch-gnome` 或 `steamos`。ESP 和模块各只有一份，四个系统共用。手动选择 `uefi` 或 `linux` 的开发构建不含完整系统。`SunUEFI-UEFI-Fastboot` 只用于[临时启动](temporary-boot.md)，`logs` 用于排查构建问题，安装时都不需要。
+发行版可选 `debian-gnome`、`debian-kde`、`nyarch-gnome` 或 `steamos`。ESP 和模块各只有一份，四个系统共用。模块和镜像使用同一源码版本，ESP 和 root 从同一次构建取得。
 
 把模块 ZIP 和两个镜像文件保存在平板上。模块 ZIP 不要解压，镜像文件放在任意位置，之后在助手里用文件选择器选取。刷写稀疏镜像需要 0.5.2 或更新的助手。
 
@@ -36,7 +36,7 @@
 
 ## 3. 安装系统镜像
 
-在 **存储** 页的 **安装或更新系统** 里，分别选择 `esp.sparse.img` 和 `root-发行版.sparse.img`，点 **安装所选镜像**，确认后等待完成，期间不要重启或断电。刷写会覆盖独立分区里原有的系统和文件，Android 数据不受影响。
+在 **存储** 页的 **安装或更新系统** 里，分别选择 `esp.img` 和 `root.ext4.img`，点 **安装所选镜像**，确认后等待完成，期间不要重启或断电。刷写会覆盖独立分区里原有的系统和文件，Android 数据不受影响。
 
 ## 4. 启动 Linux
 

@@ -39,4 +39,4 @@ python3 tools/check_host.py --group python-all
 
 ## CI 检查
 
-GitHub Actions 的 **Build products** 在 `main` 上有相关源码变动时自动运行，覆盖 `uefi`、`linux` 以及四个发行版。CI 使用与本地相同的 `./build.sh`、固定子模块和补丁配置，不连接物理设备。
+GitHub Actions 的 **Build products** 在 `main` 上有 UEFI 或 Android 模块构建输入变动时自动运行，也支持手动触发。CI 使用与本地相同的 `./build.sh uefi`、`./build.sh module`、固定子模块和补丁配置，不连接物理设备。下载文件见[CI 下载](building.md#ci-下载)。

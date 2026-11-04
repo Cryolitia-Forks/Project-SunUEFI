@@ -21,7 +21,7 @@
 
 ## 安装
 
-从 [Build products](https://github.com/slwyts/Project-SunUEFI/actions/workflows/build-products.yml) 同一次构建里下载三个包：`SunUEFI-Module`（引导助手模块）、`SunUEFI-ESP`（启动镜像）和 `SunUEFI-Root-发行版`（系统镜像）。把解压出来的模块 ZIP 和两个 `.sparse.img` 文件放到平板上，然后：
+从 [Build products](https://github.com/slwyts/Project-SunUEFI/actions/workflows/build-products.yml) 下载并解压 `SunUEFI-Module`，按[构建手册](../devel/building.md)准备匹配版本的启动镜像和所选发行版的系统镜像。把模块 ZIP 和两个镜像文件放到平板上，然后：
 
 1. 在 KernelSU 或 SukiSU 的模块页面安装模块 ZIP，提示出现时按音量＋安装引导，重启。
 2. 在模块卡片上点 **打开 WebUI**，进入引导助手。

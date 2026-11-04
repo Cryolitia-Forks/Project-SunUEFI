@@ -6,7 +6,7 @@ SunUEFI 引导助手在 Android 中安装和维护合体 BOOT，提供 Android�
 
 ## 使用
 
-1. 从 **Build products** 的 `SunUEFI-Module` 下载并解压模块包，将里面的 `SunUEFI-Piano-版本.zip` 传到平板。
+1. 从 **Build products** 下载并解压 `SunUEFI-Module`，将里面的 `SunUEFI-Piano-版本.zip` 传到平板，也可以按[构建说明](#构建)在本地生成模块。
 2. 在正常运行的 Android 中，用 SukiSU 的模块页面安装 ZIP。相同核心只读取、不重写 BOOT；其余情况提示音量＋安装或更新引导，音量－只安装助手。30 秒未选择时只安装助手，可稍后在维护页安装引导。
 3. 正常重启，点击模块卡片上的 **打开 WebUI**。
 
@@ -76,7 +76,7 @@ SukiSU 安装、模块激活和 WebUI 状态读取已在设备上使用。Kernel
 ./build.sh module-package --inspect
 ```
 
-GitHub Actions 的 `uefi` 和 `debian-gnome` 目标同一轮构建模块，独立上传 ZIP、构建清单和摘要。它们使用相同的构建入口，无需先从设备导出已有核心。模块安装合体 BOOT 与首次分区是两件事：安装引导不会创建 ESP／root；存储页的新分区流程仍需实机验证。
+GitHub Actions 和本地都通过相同入口构建 UEFI 核心及 Android 模块，无需先从设备导出已有核心。下载文件见[CI 下载](../building.md#ci-下载)。模块安装合体 BOOT 与首次分区是两件事：安装引导不会创建 ESP／root；存储页的新分区流程仍需实机验证。
 
 原厂 F2FS 挂载前扩容仍由系统负责，不能用离线工具直接调整已挂载的 Android 数据分区。存储细节见 [Android 存储扩容](android-storage.md)，BOOT 包装和无损重建见 [原生重打包工具](combined-boot.md)，启动路线与原厂 Recovery 优先规则见 [重启请求](reboot-request.md)。
 

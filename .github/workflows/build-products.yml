@@ -5,90 +5,63 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/build-products.yml'
+      - '.gitmodules'
       - 'build.sh'
       - 'Makefile'
       - 'requirements-build.txt'
+      - 'sources.lock.json'
       - 'containers/**'
       - 'config/**'
-      - 'sources.lock.json'
-      - '.gitmodules'
-      - 'patches/**'
+      - 'patches/firmware/**'
       - 'uefi/**'
       - 'vendor/piano/**'
-      - 'vendor/piano-linux/**'
-      - 'vendor/firmware/**'
-      - 'linux/**'
-      - 'tools/**'
-      - 'upstream/**'
       - 'android/**'
-      - 'docs/user/install-from-artifact.md'
+      - 'linux/kernel-profiles.json'
+      - 'tools/**'
+      - 'upstream/Mu-Silicium'
+      - 'upstream/simple-init'
+      - 'upstream/linux-piano'
+      - 'upstream/dtc'
   workflow_dispatch:
-    inputs:
-      target:
-        description: Product to build
-        type: choice
-        options: [all, uefi, linux, debian-gnome, debian-kde, nyarch-gnome, steamos]
-        default: all
 
 permissions:
   contents: read
 
+concurrency:
+  group: build-module-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  select:
-    runs-on: ubuntu-24.04
-    outputs:
-      has_build: ${{ steps.targets.outputs.has_build }}
-      matrix: ${{ steps.targets.outputs.matrix }}
-      shared_target: ${{ steps.targets.outputs.shared_target }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-          submodules: false
-          persist-credentials: false
-      - id: targets
-        env:
-          PUSH_BEFORE: ${{ github.event.before }}
-          MANUAL_TARGET: ${{ inputs.target }}
-        run: python3 tools/ci_build_targets.py
   build:
-    needs: select
-    if: needs.select.outputs.has_build == 'true'
-    concurrency:
-      group: build-products-${{ github.ref }}-${{ matrix.target }}
-      # Rootfs builds take over an hour. Finish the running image; GitHub keeps
-      # only the newest pending build for the same branch and distribution.
-      cancel-in-progress: false
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     env:
-      # TARGET is reserved by Cargo/bindgen for the compiler target triple.
-      SUNUEFI_BUILD_TARGET: ${{ matrix.target }}
-    runs-on: ${{ (startsWith(matrix.target, 'debian-') || matrix.target == 'steamos' || matrix.target == 'nyarch-gnome') && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-    timeout-minutes: 300
+      SUNUEFI_BUILD_TARGET: uefi
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: false
           persist-credentials: false
-      - name: Get only required fixed sources
-        run: ./build.sh sources
+      - name: Get required fixed sources
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          ./build.sh sources 2>&1 | tee build/logs/sources.log
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: build/ccache
-          key: ccache-${{ runner.arch }}-${{ env.SUNUEFI_BUILD_TARGET }}-${{ hashFiles('sources.lock.json', 'patches/**', 'config/build-container.json') }}-${{ github.sha }}
+          key: ccache-${{ runner.arch }}-uefi-${{ hashFiles('sources.lock.json', 'patches/firmware/**', 'config/**') }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.arch }}-${{ env.SUNUEFI_BUILD_TARGET }}-${{ hashFiles('sources.lock.json', 'patches/**', 'config/build-container.json') }}-
+            ccache-${{ runner.arch }}-uefi-${{ hashFiles('sources.lock.json', 'patches/firmware/**', 'config/**') }}-
       - name: Build the pinned-base environment
-        run: python3 tools/build_container.py
-      - name: Build selected product
         run: |
           set -o pipefail
-          # The container writes as root; keep the host-side download staging
-          # directory owned by the runner for the upload steps below.
-          mkdir -p build/logs build/ccache artifacts/downloads
-          docker run --rm --privileged \
+          python3 tools/build_container.py 2>&1 | tee build/logs/container.log
+      - name: Build UEFI and Android module
+        run: |
+          set -o pipefail
+          mkdir -p build/ccache artifacts/android
+          docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
             -e CCACHE_DIR=/workspace/build/ccache -e CCACHE_MAXSIZE=3G \
             -e SUNUEFI_BUILD_TARGET sunuefi-builder bash -euc '
@@ -97,39 +70,8 @@ jobs:
               python3 -m venv .venv
               .venv/bin/pip install -r requirements-build.txt
               . .venv/bin/activate
-              case "$SUNUEFI_BUILD_TARGET" in
-                uefi)
-                  ./build.sh uefi
-                  ./build.sh module
-                  ;;
-                linux)
-                  ./build.sh linux
-                  ;;
-                steamos|nyarch-gnome)
-                  ./build.sh uefi
-                  ./build.sh module
-                  ./build.sh linux
-                  ./build.sh "$SUNUEFI_BUILD_TARGET-rootfs"
-                  ./build.sh package \
-                    --rootfs "build/distros/$SUNUEFI_BUILD_TARGET-piano/rootfs" \
-                    --rootfs-manifest "build/distros/$SUNUEFI_BUILD_TARGET-piano/manifest.json" \
-                    --initramfs "build/distros/$SUNUEFI_BUILD_TARGET-piano/initramfs/initramfs.cpio.gz" \
-                    --root-size-mib 16384
-                  python3 tools/package_sparse_images.py --bundle artifacts/release --output artifacts/fastboot-sparse
-                  ;;
-                debian-gnome|debian-kde)
-                  python3 -c "import sys; sys.path.insert(0, \"tools\"); from build_release_rootfs import require_host; require_host()"
-                  ./build.sh uefi
-                  ./build.sh module
-                  ./build.sh linux
-                  ./build.sh mesa
-                  ./build.sh sensors
-                  ./build.sh ffmpeg --install-dependencies
-                  ./build.sh release-rootfs --desktop "${SUNUEFI_BUILD_TARGET#debian-}"
-                  ./build.sh package --root-size-mib 8192
-                  python3 tools/package_sparse_images.py --bundle artifacts/release --output artifacts/fastboot-sparse
-                  ;;
-              esac
+              ./build.sh uefi
+              ./build.sh module
             ' 2>&1 | tee build/logs/ci-build.log
       - name: Show failed build output
         if: failure()
@@ -137,132 +79,37 @@ jobs:
           if [ -f build/logs/ci-build.log ]; then
             tail -n 160 build/logs/ci-build.log
           fi
-          for log in build/distros/release.build.log build/ffmpeg/build.log build/gsd/build.log build/mutter/build.log; do
-            if [ -f "$log" ]; then
-              echo "::group::$log"
-              tail -n 100 "$log"
-              echo "::endgroup::"
-            fi
-          done
-      - name: Prepare shared downloads
-        if: always() && matrix.target == needs.select.outputs.shared_target && matrix.target != 'linux'
+      - name: Verify Android module download
         run: |
-          mkdir -p artifacts/downloads/module artifacts/downloads/uefi artifacts/downloads/esp
-          if [ -f artifacts/android/manifest.json ]; then
-            cp artifacts/android/SunUEFI-Piano-*.zip artifacts/downloads/module/
-          fi
-          if [ -f artifacts/product/PianoUEFI-product.img ]; then
-            cp artifacts/product/PianoUEFI-product.img artifacts/downloads/uefi/SunUEFI-UEFI-Fastboot.img
-            cp uefi/components/product-support/Library/ConsoleScale/OFL.txt artifacts/downloads/uefi/
-          fi
-          if [ -f artifacts/fastboot-sparse/manifest.json ]; then
-            cp artifacts/fastboot-sparse/esp.img artifacts/downloads/esp/esp.sparse.img
-          fi
+          cd artifacts/android
+          sha256sum -c SHA256SUMS
       - name: Android assistant module
-        if: always() && matrix.target == needs.select.outputs.shared_target
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: SunUEFI-Module
-          path: artifacts/downloads/module/
-          if-no-files-found: ignore
-          retention-days: 7
-          compression-level: 0
-      - name: UEFI for fastboot boot
-        if: always() && matrix.target == needs.select.outputs.shared_target
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: SunUEFI-UEFI-Fastboot
-          path: artifacts/downloads/uefi/
-          if-no-files-found: ignore
-          retention-days: 7
-          compression-level: 0
-      - name: Shared sparse ESP
-        if: always() && matrix.target == needs.select.outputs.shared_target
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: SunUEFI-ESP
-          path: artifacts/downloads/esp/
-          if-no-files-found: ignore
-          retention-days: 7
-          compression-level: 1
-      - name: Prepare sparse root download
-        if: startsWith(matrix.target, 'debian-') || matrix.target == 'steamos' || matrix.target == 'nyarch-gnome'
-        run: |
-          mkdir -p artifacts/downloads/root
-          cp artifacts/fastboot-sparse/root.ext4.img "artifacts/downloads/root/root-${SUNUEFI_BUILD_TARGET}.sparse.img"
-      - name: Distribution sparse root
-        if: startsWith(matrix.target, 'debian-') || matrix.target == 'steamos' || matrix.target == 'nyarch-gnome'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: SunUEFI-Root-${{ matrix.target }}
-          path: artifacts/downloads/root/
+          path: |
+            artifacts/android/SunUEFI-Piano-*.zip
+            artifacts/android/SHA256SUMS
           if-no-files-found: error
           retention-days: 7
-          compression-level: 1
-      - name: Stage build logs for the combined archive
+          compression-level: 0
+      - name: Build logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: build-logs-${{ matrix.target }}
+          name: logs
           path: |
             build/logs/
             sources.lock.json
-            config/release.json
-            config/steamos.json
-            config/fingerprint.json
-            config/nyarch.json
-            build/distros/nyarch-gnome-piano/manifest.json
-            build/distros/nyarch-gnome-piano/build.log
-            build/distros/nyarch-gnome-piano/packages.tsv
-            build/distros/nyarch-gnome-piano/packages/ffmpeg/SOURCE.json
-            build/steamos-base/SOURCE.json
-            build/distros/steamos-piano/manifest.json
-            build/distros/steamos-piano/packages.tsv
-            build/distros/steamos-piano/packages/ffmpeg/SOURCE.json
-            linux/bsp/manifest.json
-            linux/dts/piano-cpu-model.dtso
-            linux/dts/piano-audio-dmic-clock.dtso
-            build/release/source-manifest.json
-            build/mesa/SHA256SUMS
-            build/sensors/SOURCE
-            build/sensors/SHA256SUMS
-            build/ffmpeg/SOURCE.json
-            build/ffmpeg/SHA256SUMS
-            build/ffmpeg/build.log
-            build/distros/release/manifest.json
-            build/distros/release.build.log
-            build/distros/release/FAILED.json
-            build/gsd/SOURCE.json
-            build/gsd/build.log
-            build/mutter/SOURCE.json
-            build/mutter/SHA256SUMS
-            build/mutter/build.log
-            build/distros/release/packages.tsv
-            build/distros/release/adapters/manifest.json
-            build/distros/release/runtime/manifest.json
+            config/piano-product.json
+            patches/firmware/series.json
+            artifacts/product/manifest.json
             artifacts/android/manifest.json
             build/android-product-module/manifest.json
-            artifacts/product/manifest.json
-            artifacts/kernels/release/config
-            artifacts/kernels/release/manifest.json
-            artifacts/release/manifest.json
-            artifacts/fastboot-sparse/manifest.json
-            artifacts/fastboot-sparse/SHA256SUMS
+            build/android-product-module/sysroot-source.json
+            build/android-product-module/e2fs-tools/build.log
+            artifacts/simpleinit/product/source-manifest.json
+            artifacts/simpleinit/product/build-ok.json
           if-no-files-found: warn
-          retention-days: 7
-          compression-level: 0
-
-  logs:
-    needs: [select, build]
-    if: always() && needs.select.outputs.has_build == 'true'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Publish one logs.zip and remove intermediate log artifacts
-        uses: actions/upload-artifact/merge@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: logs
-          pattern: build-logs-*
-          separate-directories: true
-          delete-merged: true
           retention-days: 7
           compression-level: 6
