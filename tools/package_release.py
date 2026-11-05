@@ -25,10 +25,21 @@ MIB = 1024 * 1024
 CLOCK_EPOCH = 'usr/lib/clock-epoch'
 
 
-def normalize_mainline_bindings(board):
+def normalize_mainline_bindings(board, *, enable_media=True):
     """Remove downstream-only bindings retained by the folded Android DT."""
     parsed = read_fdt(board.read_bytes())
     tree, changes = parsed['tree'], []
+    inactive_compatibles = {b'arm,coresight-static-funnel',
+                           b'arm,coresight-static-replicator',
+                           b'qcom,spmi-temp-alarm'}
+
+    def enabled(path):
+        while path:
+            if tree[path].get('status', b'okay\0') not in (b'ok\0', b'okay\0'):
+                return False
+            path = path.rsplit('/', 1)[0]
+        return True
+
     legacy = (
         '/soc/qcom,sde_cesta@0x0af30000',
         '/soc/qcom,mdss_mdp@ae00000',
@@ -131,6 +142,28 @@ def normalize_mainline_bindings(board):
         # slice prevents registration of the entire SDAM, including OCP.
         del props['bits']
         changes.append(path + ':bits')
+    # These downstream trace/alarm devices were excluded by the BSP's module
+    # policy. Apply this after disabling absent PMICs so their hidden children
+    # stay untouched. CPU TSENS and battery thermal management are separate.
+    for path, props in tree.items():
+        if inactive_compatibles.intersection(props.get('compatible', b'').split(b'\0')) and enabled(path):
+            props['status'] = b'disabled\0'
+            changes.append(path + ':status')
+    if not enable_media:
+        # First normalize the replacements above, then omit optional media
+        # consumers. Otherwise a disabled replacement revives the stock CCI.
+        # Rear flash and charger controls are independent and stay available.
+        for path in (
+            '/soc/isp-ml@ad27000', '/soc/cci-ml@ac7b000',
+            '/soc/clock-controller-ml@ade0000',
+            '/soc/clock-controller-ml@1760000',
+            '/soc/video-codec-ml@aa00000',
+            '/soc/clock-controller-ml@aaf0000',
+            '/soc/qcom,qupv3_2_geni_se@8c0000/i2c@884000/camera@10',
+        ):
+            if path in tree and tree[path].get('status') != b'disabled\0':
+                tree[path]['status'] = b'disabled\0'
+                changes.append(path + ':status')
     if changes:
         board.write_bytes(write_fdt(parsed))
     return {'changes': changes, 'sha256': sha(board)}
@@ -144,6 +177,30 @@ def require(ok, message):
 def sha(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def apply_memory_layout(board, capacity_gib):
+    """Select the validated DDR map without replacing unrelated board devices."""
+    if capacity_gib == 16:
+        return None
+    require(capacity_gib == 24, 'Unsupported Piano RAM capacity')
+    memory = json.loads((ROOT / 'config/memory-layouts/piano-24gb.json').read_text())
+    require(sha(board) == memory['baseSha256'],
+            'The selected RAM layout does not match the base DTB')
+    properties = memory['properties']
+    require(set(properties) == {'/memory', '/ddr-regions'} and
+            set(properties['/memory']) == {'reg', 'ddr_size', 'ddr_manufacturer_id'} and
+            set(properties['/ddr-regions']) == {'region2'},
+            'RAM layouts may replace only the four verified DDR properties')
+    parsed = read_fdt(board.read_bytes())
+    for node, values in properties.items():
+        require(node in parsed['tree'], 'RAM layout target is missing: ' + node)
+        for key, value in values.items():
+            parsed['tree'][node][key] = bytes.fromhex(value)
+    board.write_bytes(write_fdt(parsed))
+    require(sha(board) == memory['resultSha256'],
+            'The selected RAM layout did not produce its verified DTB')
+    return memory
 
 
 def run(argv, **kwargs):

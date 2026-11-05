@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+/dts-v1/;
+/plugin/;
+
+/* Firmware handover still touches the panel's shared resources. Start ADSP
+ * after the native display has taken over, while keeping normal driver probing.
+ */
+&{/soc/remoteproc-adsp@03000000} {
+	qcom,no-auto-boot;
+};

@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+/dts-v1/;
+/plugin/;
+
+/* The stock tree attaches this pool to the downstream CNSS node. ath12k
+ * uses the actual PCI endpoint, so its coherent DMA allocations need the
+ * pool reference there instead.
+ */
+/ {
+	fragment@0 {
+		target-path = "/soc/pcie@1c00000/pcie0_rp/wifi@0";
+		__overlay__ {
+			memory-region = <&cnss_wlan_mem>;
+		};
+	};
+};
