@@ -49,6 +49,11 @@ def normalize_mainline_bindings(board, *, enable_media=True):
         '/soc/spf_core_platform',
     )
     for path, props in tree.items():
+        # The folded Android tree uses an empty list for devices without an
+        # IOMMU. Mainline expects the property to be absent in that case.
+        if props.get('iommus') == b'':
+            del props['iommus']
+            changes.append(path + ':iommus')
         if (path == '/soc/xiaomi_fingerprint' and
                 props.get('compatible') == b'xiaomi,piano-goodix-control\0'):
             # The new controller uses the real mainline supply and GPIOs.
