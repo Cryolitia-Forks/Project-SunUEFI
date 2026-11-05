@@ -32,6 +32,16 @@ def normalize_mainline_bindings(board, *, enable_media=True):
     inactive_compatibles = {b'arm,coresight-static-funnel',
                            b'arm,coresight-static-replicator',
                            b'qcom,spmi-temp-alarm'}
+    # Linux's CS_AMBA_ID mask identifies the downstream trace blocks even
+    # when Android describes them only as arm,primecell. Their MMIO probe
+    # stalls this platform; keep the unadapted trace graph inactive.
+    trace_peripheral_ids = {
+        0xbb908,  # Funnel
+        0xbb909,  # Replicator
+        0xbb961,  # TMC
+        0xbb962,  # STM
+        0xbb922,  # CTI
+    }
 
     def enabled(path):
         while path:
@@ -151,7 +161,11 @@ def normalize_mainline_bindings(board, *, enable_media=True):
     # policy. Apply this after disabling absent PMICs so their hidden children
     # stay untouched. CPU TSENS and battery thermal management are separate.
     for path, props in tree.items():
-        if inactive_compatibles.intersection(props.get('compatible', b'').split(b'\0')) and enabled(path):
+        compatibles = props.get('compatible', b'').split(b'\0')
+        peripheral_id = props.get('arm,primecell-periphid', b'')
+        trace = (b'arm,primecell' in compatibles and len(peripheral_id) == 4 and
+                 struct.unpack('>I', peripheral_id)[0] & 0x000fffff in trace_peripheral_ids)
+        if (inactive_compatibles.intersection(compatibles) or trace) and enabled(path):
             props['status'] = b'disabled\0'
             changes.append(path + ':status')
     if not enable_media:
