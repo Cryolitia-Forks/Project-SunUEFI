@@ -1,12 +1,12 @@
 # Piano 的 RGB 灯、红外与侧指纹
 
-2026-10-08 核对原厂最终 DT、Android 驱动绑定、当前 Linux 源码和已有运行记录。以下三项尚未完成实机功能验证；没有操作发光、发射、指纹录入或认证。
+本页记录 RGB 通道、SPI 红外和 Goodix 侧指纹的原厂接口与 Linux 实现。指纹客户端提供初始化和受限存储探测，桌面认证还需要 libfprint 后端。
 
 | 功能 | 原厂接口 | 当前 Linux 缺口 |
 | --- | --- | --- |
 | RGB 通道 | PM8550 SID1 上的 `qcom,pm8350c-pwm`，SPMI LPG，通道 1/2/3 为 red/green/blue | 标准驱动和产品DT已有；补齐SDAM/LPG模块加载后已出现三个标准LED接口。发光、可见位置和用途尚待确认。 |
 | 红外发射 | SE15 / SPI `0x89c000` / CS0，`ir-spi`，Android 原始波形字符设备 | 已确认原厂约40%占空比、低电平间隔和32位打包；控制器标准绑定及LIRC待接入，光学输出未验证。 |
-| 侧指纹 | Goodix，GPIO 控制与高通 QTEE 安全服务 | 供电、复位、中断和安全程序设备查询已接通；录入、认证和 fprintd 接入尚未完成。 |
+| 侧指纹 | Goodix，GPIO 控制与高通 QTEE 安全服务 | 供电、复位、中断、初始化和受限 FS/GPFS 探测已接通；录入、认证和 fprintd 接入尚未完成。 |
 
 ## RGB 通道
 
@@ -131,11 +131,27 @@ QSEECOMPAT 的 lookup 返回 `architecture=2`，命令应使用 64 位地址，
 不保存或输出图像、模板和认证令牌。启动与待机过程已收到中断并完成确认；
 这不等于手指检测、匹配或解锁已经完成。Ctrl+C 可正常结束并释放硬件。
 
-`sudo piano-fingerprint-ctl list 1000` 通过命令 1014 选择 Linux UID 1000 的
-独立分组，再通过 1015 枚举模板。原生状态目录为
-`/var/lib/piano-goodix/<uid>`，不复用 Android 路径，也不读取或修改原厂模板。
-新建分组已正常返回空列表；最大模板数量取自设备信息，并按响应容量解析。
+`sudo piano-fingerprint-ctl list 1000` 创建 Linux 目录
+`/var/lib/piano-goodix/1000`，将分组 ID 和路径交给命令 1014，再通过 1015
+枚举模板。这个命令没有文件服务；传入 Linux 路径或返回空列表，都不能证明
+安全程序的 FTS 存储已经独立。最大模板数量取自设备信息，并按响应容量解析。
 标准 fprintd 用户元数据仍由后续的 libfprint 集成管理。
+
+`storage-probe --state-dir <empty-directory> <group>` 显式启动受限 FS/GPFS
+服务，初始化传感器并选择分组，随后关闭安全程序和服务。目录必须是新建的
+Linux 空目录；服务将安全程序使用的虚拟路径映射到这里，不访问原厂目录。
+初始化会在该目录生成校准文件，所以这是带本地写入的探测，不是只读查询。
+命令不复制模板、不录入、不认证，也不执行删除或重命名。
+
+文件服务位于 [`piano-goodix-storage.c`](../../../linux/userspace/fingerprint/piano-goodix-storage.c)。
+普通 FS 仅提供受限打开、关闭和错误状态，GPFS 处理初始化所需的文件请求；
+路径解析拒绝目录穿越、符号链接及外部文件描述符。空目录实机探测已完成
+初始化和组选择，并生成四份校准元数据；这不代表 Android 模板可直接用于认证，
+也不证明安全程序内部状态与 Android 已隔离。
+
+[`MinkIPC 补丁系列`](../../../patches/minkipc/0.1.0/series.json)修正回调输出缓冲区的
+重复释放与异常回收，并避免工作线程释放最后一个 root object 时自等待。
+构建器在固定上游提交的副本中应用补丁，记录补丁及存储源码的摘要；原始源码缓存保持不变。
 
 `sudo piano-fingerprint-ctl prepare-auth` 初始化传感器并完成 Keymaster 到
 Goodix 的认证数据绑定。没有录入或认证操作，也不输出绑定数据。
@@ -154,9 +170,9 @@ sharing key，已有绑定可用时直接使用，避免重置其他客户端的
 响应的偏移和长度均检查边界，临时参数和加密绑定数据在结束时清零。
 没有把密钥、令牌或指纹模板保存到普通文件。
 
-另已补齐安全程序使用的
-[旧 GPFS 文件命令](../../../linux/bsp/patches/qtee/README.md)，当前仅作为待集成源码保留，
-不增加默认后台服务。诊断使用的 RPMB 提供者拒绝写入，未修改原厂安全存储。
+上述 FS/GPFS 只在显式 `storage-probe` 进程内提供，不增加默认后台服务。
+原有[旧 GPFS 协议记录](../../../linux/bsp/patches/qtee/README.md)保留厂商接口说明；
+它不是 Linux 文件系统隔离或 RPMB 写入授权的依据。
 
 完整命令协议和 libfprint 后端仍在适配，因此不能在 Linux 中录入或验证指纹。
 
