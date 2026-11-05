@@ -1,0 +1,843 @@
+From ada687cae527c0c4dcaa159fd071dd9c9459b041 Mon Sep 17 00:00:00 2001
+From: Cryolitia PukNgae <cryolitia@gmail.com>
+Date: Fri, 6 Nov 2026 06:31:07 +0800
+Subject: [PATCH] drm/msm: support bonded DSI AVR atomic updates
+
+Configure DPU AVR and both DSI receivers through atomic commits on the
+bonded video topology. Trigger both interfaces after normal plane flush,
+exit AVR before bridge shutdown, and size waits from the maximum frame
+period. Use real IRQ timestamps while front-porch duration varies.
+
+Require an explicit connector capability and monitor range; unsupported
+requests keep fixed timing. This change publishes neither for P81. Panel
+continuous timing limits and recovery after an AVR exit timeout remain
+outside the implemented normal path.
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c      |  44 +++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h      |   1 +
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c   | 241 ++++++++++++++++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h   |  12 +
+ .../drm/msm/disp/dpu1/dpu_encoder_phys_vid.c  |  24 +-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c   |  46 +++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h   |   7 +
+ drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c       |  22 ++
+ drivers/gpu/drm/msm/dsi/dsi.h                 |   2 +
+ drivers/gpu/drm/msm/dsi/dsi_host.c            |  63 +++++
+ drivers/gpu/drm/msm/dsi/dsi_manager.c         |  16 ++
+ drivers/gpu/drm/msm/msm_drv.h                 |   6 +
+ drivers/gpu/drm/msm/registers/display/dsi.xml |   1 +
+ 13 files changed, 481 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 77bfbd02d..3d93c9db8 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -269,6 +269,22 @@ static int dpu_crtc_get_crc(struct drm_crtc *crtc)
+ 	return -EINVAL;
+ }
+ 
++static bool dpu_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
++					 int *max_error, ktime_t *vblank_time,
++					 bool in_vblank_irq)
++{
++	struct drm_encoder *encoder = get_encoder_from_crtc(crtc);
++
++	/*
++	 * A waiting AVR front porch has no predictable end. Use the real IRQ
++	 * timestamp fallback instead of extrapolating from nominal vtotal.
++	 */
++	if (encoder && dpu_encoder_vrr_active(encoder))
++		return false;
++	return drm_crtc_vblank_helper_get_vblank_timestamp(crtc, max_error,
++							vblank_time, in_vblank_irq);
++}
++
+ static bool dpu_crtc_get_scanout_position(struct drm_crtc *crtc,
+ 					   bool in_vblank_irq,
+ 					   int *vpos, int *hpos,
+@@ -1264,6 +1280,7 @@ static void dpu_crtc_atomic_print_state(struct drm_printer *p,
+ 	const struct dpu_crtc_state *cstate = to_dpu_crtc_state(state);
+ 	int i;
+ 
++	drm_printf(p, "\tavr_max_vtotal=%u\n", cstate->avr_max_vtotal);
+ 	for (i = 0; i < cstate->num_mixers; i++) {
+ 		drm_printf(p, "\tlm[%d]=%d\n", i, cstate->mixers[i].hw_lm->idx - LM_0);
+ 		drm_printf(p, "\tctl[%d]=%d\n", i, cstate->mixers[i].lm_ctl->idx - CTL_0);
+@@ -1684,9 +1701,30 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
+ 
+ 	int rc = 0;
+ 
++	struct drm_encoder *encoder;
+ 	bool needs_dirtyfb = dpu_crtc_needs_dirtyfb(crtc_state);
+ 	struct dpu_kms *kms = _dpu_crtc_get_kms(crtc);
+ 
++	cstate->avr_max_vtotal = 0;
++	if (crtc_state->active && crtc_state->vrr_enabled) {
++		struct drm_crtc_state *old = drm_atomic_get_old_crtc_state(state, crtc);
++
++		if (old->active && old->vrr_enabled && !crtc_state->mode_changed &&
++		    !crtc_state->connectors_changed && !crtc_state->active_changed &&
++		    old->encoder_mask == crtc_state->encoder_mask &&
++		    old->self_refresh_active == crtc_state->self_refresh_active) {
++			cstate->avr_max_vtotal = to_dpu_crtc_state(old)->avr_max_vtotal;
++		} else {
++			/* Range and preferred-mode metadata need the connection mutex. */
++			rc = drm_atomic_add_affected_connectors(state, crtc);
++			if (rc)
++				return rc;
++			drm_for_each_encoder_mask(encoder, crtc->dev, crtc_state->encoder_mask)
++				cstate->avr_max_vtotal =
++					dpu_encoder_check_vrr(encoder, state, crtc_state);
++		}
++	}
++
+ 	/* A hardware failure latches the engine unusable. Do not accept a
+ 	 * later gamma update as though its transport were still initialized.
+ 	 */
+@@ -1760,6 +1798,10 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
+ 
+ 	cstate->vfp_update = dpu_crtc_can_update_vfp(
+ 		drm_atomic_get_old_crtc_state(state, crtc), crtc_state);
++	if (cstate->vfp_update &&
++	    (cstate->avr_max_vtotal ||
++	     to_dpu_crtc_state(drm_atomic_get_old_crtc_state(state, crtc))->avr_max_vtotal))
++		cstate->vfp_update = false;
+ 	if (cstate->vfp_update)
+ 		crtc_state->mode_changed = false;
+ 
+@@ -2029,7 +2071,7 @@ static const struct drm_crtc_funcs dpu_crtc_funcs = {
+ 	.set_crc_source = dpu_crtc_set_crc_source,
+ 	.enable_vblank  = msm_crtc_enable_vblank,
+ 	.disable_vblank = msm_crtc_disable_vblank,
+-	.get_vblank_timestamp = drm_crtc_vblank_helper_get_vblank_timestamp,
++	.get_vblank_timestamp = dpu_crtc_get_vblank_timestamp,
+ 	.get_vblank_counter = dpu_crtc_get_vblank_counter,
+ };
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+index 084ea8ecf..a83f3a2fc 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+@@ -211,6 +211,7 @@ struct dpu_crtc_state {
+ 	bool bw_control;
+ 	bool bw_split_vote;
+ 	bool vfp_update;
++	u32 avr_max_vtotal;
+ 	struct drm_rect lm_bounds[CRTC_DUAL_MIXERS];
+ 
+ 	uint64_t input_fence_timeout_ns;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 416f15afc..1e980c48a 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -16,6 +16,8 @@
+ #include <drm/display/drm_dsc_helper.h>
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_crtc.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_vblank.h>
+ #include <drm/drm_file.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_framebuffer.h>
+@@ -202,6 +204,8 @@ struct dpu_encoder_virt {
+ 	atomic_t frame_done_timeout_ms;
+ 	atomic_t frame_done_timeout_cnt;
+ 	struct timer_list frame_done_timer;
++	u32 avr_max_vtotal;
++	bool avr_failed;
+ 
+ 	struct msm_display_info disp_info;
+ 
+@@ -717,6 +721,213 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 	}
+ }
+ 
++static int dpu_encoder_resource_control(struct drm_encoder *drm_enc,
++				       u32 sw_event);
++
++static bool dpu_encoder_same_vrr_family(const struct drm_display_mode *a,
++					const struct drm_display_mode *b)
++{
++	return a->clock == b->clock && a->flags == b->flags &&
++		a->hdisplay == b->hdisplay && a->htotal == b->htotal &&
++		a->hsync_start == b->hsync_start && a->hsync_end == b->hsync_end &&
++		a->hskew == b->hskew && a->vdisplay == b->vdisplay &&
++		a->vscan == b->vscan &&
++		a->vtotal - a->vsync_start == b->vtotal - b->vsync_start &&
++		a->vtotal - a->vsync_end == b->vtotal - b->vsync_end;
++}
++
++u32 dpu_encoder_check_vrr(struct drm_encoder *encoder,
++			 struct drm_atomic_commit *state,
++			 struct drm_crtc_state *crtc_state)
++{
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++	const struct drm_display_mode *mode = &crtc_state->adjusted_mode;
++	struct drm_connector *connector;
++	struct drm_display_mode *native;
++	u64 capable, max_vtotal;
++	u32 min_hz, max_hz;
++	bool native_found = false;
++	unsigned int i;
++
++	if (!crtc_state->active || !crtc_state->vrr_enabled ||
++	    crtc_state->self_refresh_active ||
++	    hweight32(crtc_state->encoder_mask) != 1 ||
++	    enc->disp_info.num_of_h_tiles != 2 ||
++	    !of_machine_is_compatible("xiaomi,piano") ||
++	    enc->disp_info.intf_type != INTF_DSI || enc->disp_info.is_cmd_mode)
++		return 0;
++
++	connector = drm_atomic_get_new_connector_for_encoder(state, encoder);
++	if (!connector || !connector->vrr_capable_property ||
++	    drm_object_property_get_value(&connector->base,
++			connector->vrr_capable_property, &capable) || !capable)
++		return 0;
++
++	/* Only a validated receiver range may authorize AVR. P81 has none yet. */
++	min_hz = connector->display_info.monitor_range.min_vfreq;
++	max_hz = connector->display_info.monitor_range.max_vfreq;
++	if (!min_hz || max_hz < min_hz ||
++	    drm_mode_vrefresh(mode) < min_hz || drm_mode_vrefresh(mode) > max_hz)
++		return 0;
++
++	list_for_each_entry(native, &connector->modes, head) {
++		if (!(native->type & DRM_MODE_TYPE_PREFERRED))
++			continue;
++		if (!dpu_encoder_same_vrr_family(mode, native))
++			return 0;
++		native_found = true;
++		break;
++	}
++	if (!native_found)
++		return 0;
++
++	for (i = 0; i < enc->num_phys_encs; i++) {
++		struct dpu_hw_intf *intf = enc->phys_encs[i]->hw_intf;
++
++		if (!intf || !intf->ops.setup_avr || !intf->ops.enable_avr ||
++		    !intf->ops.trigger_avr ||
++		    mode->vtotal - mode->vsync_start < intf->cap->prog_fetch_lines_worst_case)
++			return 0;
++	}
++
++	max_vtotal = div64_u64((u64)mode->clock * 1000,
++				(u64)mode->htotal * min_hz);
++	if (max_vtotal <= mode->vtotal || max_vtotal > U32_MAX)
++		return 0;
++	return max_vtotal;
++}
++
++bool dpu_encoder_vrr_active(struct drm_encoder *encoder)
++{
++	return READ_ONCE(to_dpu_encoder_virt(encoder)->avr_max_vtotal) != 0;
++}
++
++u32 dpu_encoder_vrr_timeout_ms(struct drm_encoder *encoder, u32 frames)
++{
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++	u32 max_vtotal = READ_ONCE(enc->avr_max_vtotal);
++	const struct drm_display_mode *mode;
++
++	if (!max_vtotal || !enc->cur_master)
++		return 0;
++	mode = &enc->cur_master->cached_mode;
++	return DIV_ROUND_UP_ULL((u64)frames * max_vtotal * mode->htotal,
++			       mode->clock);
++}
++
++static int dpu_encoder_configure_vrr(struct drm_encoder *encoder, u32 max_vtotal)
++{
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++	struct msm_drm_private *priv = encoder->dev->dev_private;
++	u32 index = enc->disp_info.h_tile_instance[0];
++	unsigned long flags;
++	unsigned int i;
++	int ret;
++
++	if (!max_vtotal || READ_ONCE(enc->avr_failed) || enc->avr_max_vtotal)
++		return 0;
++
++	/* The prototype implements the known bonded, shared-CTL topology only. */
++	for (i = 0; i < enc->num_phys_encs; i++) {
++		struct dpu_encoder_phys *phys = enc->phys_encs[i];
++
++		if (phys->hw_ctl != enc->cur_master->hw_ctl)
++			return -EOPNOTSUPP;
++	}
++
++	ret = msm_dsi_set_avr(priv->kms->dsi[index], true);
++	if (ret)
++		return ret;
++	for (i = 0; i < enc->num_phys_encs; i++) {
++		ret = dpu_encoder_phys_vid_setup_avr(enc->phys_encs[i], max_vtotal);
++		if (ret) {
++			msm_dsi_set_avr(priv->kms->dsi[index], false);
++			return ret;
++		}
++	}
++
++	spin_lock_irqsave(&enc->enc_spinlock, flags);
++	WRITE_ONCE(enc->avr_max_vtotal, max_vtotal);
++	for (i = 0; i < enc->num_phys_encs; i++) {
++		struct dpu_encoder_phys *phys = enc->phys_encs[i];
++
++		phys->hw_intf->ops.enable_avr(phys->hw_intf, true);
++		phys->hw_ctl->ops.update_pending_flush_intf(phys->hw_ctl,
++							  phys->hw_intf->idx);
++	}
++	spin_unlock_irqrestore(&enc->enc_spinlock, flags);
++	return 0;
++}
++
++int dpu_encoder_exit_vrr(struct drm_encoder *encoder)
++{
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++	struct msm_drm_private *priv = encoder->dev->dev_private;
++	struct dpu_encoder_phys *master = enc->cur_master;
++	struct dpu_hw_ctl *ctl;
++	unsigned long flags;
++	u32 index = enc->disp_info.h_tile_instance[0];
++	u32 timeout_ms, vsync_count;
++	unsigned int i;
++	int ret;
++
++	if (!dpu_encoder_vrr_active(encoder))
++		return 0;
++
++	/* This runs before bridge disable while runtime PM and commit locks hold. */
++	ret = dpu_encoder_resource_control(encoder, DPU_ENC_RC_EVENT_KICKOFF);
++	if (ret)
++		return ret;
++	ret = drm_crtc_vblank_get(enc->crtc);
++	if (ret)
++		return ret;
++	ctl = master->hw_ctl;
++	timeout_ms = max(50U, dpu_encoder_vrr_timeout_ms(encoder, 2));
++
++	spin_lock_irqsave(&enc->enc_spinlock, flags);
++	for (i = 0; i < enc->num_phys_encs; i++) {
++		struct dpu_encoder_phys *phys = enc->phys_encs[i];
++
++		phys->hw_intf->ops.enable_avr(phys->hw_intf, false);
++		ctl->ops.update_pending_flush_intf(ctl, phys->hw_intf->idx);
++	}
++	/* Configuration-only flush: do not create a synthetic page-flip waiter. */
++	ctl->ops.trigger_flush(ctl);
++	vsync_count = atomic_read(&master->vsync_cnt);
++	for (i = 0; i < enc->num_phys_encs; i++) {
++		struct dpu_hw_intf *intf = enc->phys_encs[i]->hw_intf;
++
++		intf->ops.trigger_avr(intf);
++	}
++	spin_unlock_irqrestore(&enc->enc_spinlock, flags);
++
++	ret = wait_event_timeout(master->pending_kickoff_wq,
++				atomic_read(&master->vsync_cnt) != vsync_count &&
++				!ctl->ops.get_flush_register(ctl),
++				msecs_to_jiffies(timeout_ms));
++	drm_crtc_vblank_put(enc->crtc);
++	if (!ret) {
++		WRITE_ONCE(enc->avr_failed, true);
++		return -ETIMEDOUT;
++	}
++	ret = msm_dsi_set_avr(priv->kms->dsi[index], false);
++	if (!ret)
++		WRITE_ONCE(enc->avr_max_vtotal, 0);
++	return ret;
++}
++
++int dpu_encoder_prepare_vrr(struct drm_encoder *encoder, u32 max_vtotal,
++			    bool modeset)
++{
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++
++	if (!dpu_encoder_vrr_active(encoder) ||
++	    (!modeset && max_vtotal == enc->avr_max_vtotal &&
++	     !READ_ONCE(enc->avr_failed)))
++		return 0;
++	return dpu_encoder_exit_vrr(encoder);
++}
++
+ bool dpu_encoder_can_update_vfp(struct drm_encoder *encoder,
+ 			       const struct drm_display_mode *mode)
+ {
+@@ -1376,6 +1587,7 @@ void dpu_encoder_virt_runtime_resume(struct drm_encoder *drm_enc)
+ 	if (!dpu_enc->enabled)
+ 		goto out;
+ 
++	WRITE_ONCE(dpu_enc->avr_max_vtotal, 0);
+ 	if (dpu_enc->cur_slave && dpu_enc->cur_slave->ops.restore)
+ 		dpu_enc->cur_slave->ops.restore(dpu_enc->cur_slave);
+ 	if (dpu_enc->cur_master && dpu_enc->cur_master->ops.restore)
+@@ -1395,6 +1607,7 @@ static void dpu_encoder_virt_atomic_enable(struct drm_encoder *drm_enc,
+ 	struct drm_display_mode *cur_mode = NULL;
+ 
+ 	dpu_enc = to_dpu_encoder_virt(drm_enc);
++	WRITE_ONCE(dpu_enc->avr_max_vtotal, 0);
+ 	dpu_enc->dsc = dpu_encoder_get_dsc_config(drm_enc);
+ 
+ 	atomic_set(&dpu_enc->frame_done_timeout_cnt, 0);
+@@ -1428,6 +1641,7 @@ static void dpu_encoder_virt_atomic_enable(struct drm_encoder *drm_enc,
+ 
+ 	_dpu_encoder_virt_enable_helper(drm_enc);
+ 
++	WRITE_ONCE(dpu_enc->avr_failed, false);
+ 	dpu_enc->enabled = true;
+ 
+ out:
+@@ -2166,6 +2380,11 @@ void dpu_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc)
+ 
+ 	dpu_encoder_resource_control(drm_enc, DPU_ENC_RC_EVENT_KICKOFF);
+ 
++	/* Exit AVR before the CTL reset invalidates its flush handshake. */
++	if (needs_hw_reset && dpu_encoder_vrr_active(drm_enc) &&
++	    dpu_encoder_exit_vrr(drm_enc))
++		DPU_ERROR_ENC(dpu_enc, "AVR exit failed before CTL recovery\n");
++
+ 	/* if any phys needs reset, reset all phys, in-order */
+ 	if (needs_hw_reset) {
+ 		trace_dpu_enc_prepare_kickoff_reset(DRMID(drm_enc));
+@@ -2176,6 +2395,10 @@ void dpu_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc)
+ 
+ 	if (dpu_enc->dsc)
+ 		dpu_encoder_prep_dsc(dpu_enc, dpu_enc->dsc);
++
++	if (dpu_encoder_configure_vrr(drm_enc,
++			to_dpu_crtc_state(drm_enc->crtc->state)->avr_max_vtotal))
++		DPU_ERROR_ENC(dpu_enc, "failed to configure AVR; keeping fixed timing\n");
+ }
+ 
+ /**
+@@ -2215,6 +2438,8 @@ void dpu_encoder_start_frame_done_timer(struct drm_encoder *drm_enc)
+ 	dpu_enc = to_dpu_encoder_virt(drm_enc);
+ 	timeout_ms = DPU_ENCODER_FRAME_DONE_TIMEOUT_FRAMES * 1000 /
+ 			drm_mode_vrefresh(&drm_enc->crtc->state->adjusted_mode);
++	timeout_ms = max_t(unsigned long, timeout_ms,
++		dpu_encoder_vrr_timeout_ms(drm_enc, DPU_ENCODER_FRAME_DONE_TIMEOUT_FRAMES));
+ 
+ 	atomic_set(&dpu_enc->frame_done_timeout_ms, timeout_ms);
+ 	mod_timer(&dpu_enc->frame_done_timer,
+@@ -2248,6 +2473,19 @@ void dpu_encoder_kickoff(struct drm_encoder *drm_enc)
+ 			phys->ops.handle_post_kickoff(phys);
+ 	}
+ 
++	/* Both interfaces see the new planes before either AVR trigger. */
++	if (dpu_encoder_vrr_active(drm_enc)) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&dpu_enc->enc_spinlock, flags);
++		for (i = 0; i < dpu_enc->num_phys_encs; i++) {
++			struct dpu_hw_intf *intf = dpu_enc->phys_encs[i]->hw_intf;
++
++			intf->ops.trigger_avr(intf);
++		}
++		spin_unlock_irqrestore(&dpu_enc->enc_spinlock, flags);
++	}
++
+ 	DPU_ATRACE_END("encoder_kickoff");
+ }
+ 
+@@ -2804,6 +3042,9 @@ static void dpu_encoder_frame_done_timeout(struct timer_list *t)
+ 	}
+ 
+ 	DPU_ERROR_ENC_RATELIMITED(dpu_enc, "frame done timeout\n");
++	/* Defer MMIO recovery to the next serialized, powered commit. */
++	if (dpu_encoder_vrr_active(drm_enc))
++		WRITE_ONCE(dpu_enc->avr_failed, true);
+ 
+ 	if (atomic_inc_return(&dpu_enc->frame_done_timeout_cnt) == 1)
+ 		msm_disp_snapshot_state(drm_enc->dev);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+index ef884b0bb..67b605180 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+@@ -12,6 +12,8 @@
+ #include <drm/drm_crtc.h>
+ #include "dpu_hw_mdss.h"
+ 
++struct dpu_encoder_phys;
++
+ #define DPU_ENCODER_FRAME_EVENT_DONE			BIT(0)
+ #define DPU_ENCODER_FRAME_EVENT_ERROR			BIT(1)
+ #define DPU_ENCODER_FRAME_EVENT_PANEL_DEAD		BIT(2)
+@@ -21,6 +23,16 @@
+ 
+ #define MAX_H_TILES_PER_DISPLAY 2
+ 
++u32 dpu_encoder_check_vrr(struct drm_encoder *encoder,
++			 struct drm_atomic_commit *state,
++			 struct drm_crtc_state *crtc_state);
++bool dpu_encoder_vrr_active(struct drm_encoder *encoder);
++u32 dpu_encoder_vrr_timeout_ms(struct drm_encoder *encoder, u32 frames);
++int dpu_encoder_exit_vrr(struct drm_encoder *encoder);
++int dpu_encoder_prepare_vrr(struct drm_encoder *encoder, u32 max_vtotal,
++			    bool modeset);
++int dpu_encoder_phys_vid_setup_avr(struct dpu_encoder_phys *phys, u32 max_vtotal);
++
+ bool dpu_encoder_can_update_vfp(struct drm_encoder *encoder,
+ 			       const struct drm_display_mode *mode);
+ void dpu_encoder_update_vfp(struct drm_encoder *encoder,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+index a40baca2f..c06edc1b9 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -146,6 +146,22 @@ static void drm_mode_to_intf_timing_params(
+ 	}
+ }
+ 
++int dpu_encoder_phys_vid_setup_avr(struct dpu_encoder_phys *phys, u32 max_vtotal)
++{
++	struct drm_display_mode mode = phys->cached_mode;
++	struct dpu_hw_intf_timing_params timing;
++
++	if (phys->split_role != ENC_ROLE_SOLO) {
++		mode.hdisplay >>= 1;
++		mode.htotal >>= 1;
++		mode.hsync_start >>= 1;
++		mode.hsync_end >>= 1;
++		mode.hskew >>= 1;
++	}
++	drm_mode_to_intf_timing_params(phys, &mode, &timing);
++	return phys->hw_intf->ops.setup_avr(phys->hw_intf, &timing, max_vtotal);
++}
++
+ static u32 get_horizontal_total(const struct dpu_hw_intf_timing_params *timing)
+ {
+ 	u32 active = timing->xres;
+@@ -321,6 +337,8 @@ static void dpu_encoder_phys_vid_setup_timing_engine(
+ 	spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);
+ 	phys_enc->hw_intf->ops.setup_timing_gen(phys_enc->hw_intf,
+ 			&timing_params, fmt);
++	if (phys_enc->hw_intf->ops.enable_avr)
++		phys_enc->hw_intf->ops.enable_avr(phys_enc->hw_intf, false);
+ 	phys_enc->hw_ctl->ops.setup_intf_cfg(phys_enc->hw_ctl, &intf_cfg);
+ 
+ 	/* setup which pp blk will connect to this intf */
+@@ -515,7 +533,8 @@ static int dpu_encoder_phys_vid_wait_for_tx_complete(
+ 
+ 	wait_info.wq = &phys_enc->pending_kickoff_wq;
+ 	wait_info.atomic_cnt = &phys_enc->pending_kickoff_cnt;
+-	wait_info.timeout_ms = KICKOFF_TIMEOUT_MS;
++	wait_info.timeout_ms = max_t(u32, KICKOFF_TIMEOUT_MS,
++			dpu_encoder_vrr_timeout_ms(phys_enc->parent, 2));
+ 
+ 	if (!dpu_encoder_phys_vid_is_master(phys_enc)) {
+ 		return 0;
+@@ -545,7 +564,8 @@ static int dpu_encoder_phys_vid_wait_for_commit_done(
+ 
+ 	ret = wait_event_timeout(phys_enc->pending_kickoff_wq,
+ 		(hw_ctl->ops.get_flush_register(hw_ctl) == 0),
+-		msecs_to_jiffies(50));
++		msecs_to_jiffies(max(50U,
++			dpu_encoder_vrr_timeout_ms(phys_enc->parent, 2))));
+ 	if (ret <= 0) {
+ 		DPU_ERROR("vblank timeout: ctl=%d intf=%d flush=%x pending=%x\n",
+ 			  hw_ctl->idx, phys_enc->hw_intf->idx,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+index d26348609..d19668d0e 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+@@ -11,6 +11,7 @@
+ #include "dpu_trace.h"
+ 
+ #include <linux/iopoll.h>
++#include <linux/overflow.h>
+ 
+ #include <drm/drm_managed.h>
+ 
+@@ -282,6 +283,45 @@ static void dpu_hw_intf_update_vtotal(struct dpu_hw_intf *intf, u32 vtotal)
+ 	DPU_REG_WRITE(&intf->hw, INTF_VSYNC_PERIOD_F0, vtotal * htotal);
+ }
+ 
++/*
++ * These helpers require enabled interface clocks and a matching INTF flush.
++ * The caller supplies timings after bonded-link and DSC width conversion.
++ * This validates register arithmetic, not the panel's supported VRR range.
++ */
++static int dpu_hw_intf_setup_avr(struct dpu_hw_intf *intf,
++				 const struct dpu_hw_intf_timing_params *p, u32 max_vtotal)
++{
++	u64 htotal = (u64)p->width + p->h_front_porch +
++		     p->h_back_porch + p->hsync_pulse_width;
++	u64 vtotal = (u64)p->height + p->v_front_porch +
++		     p->v_back_porch + p->vsync_pulse_width;
++	u32 max_period;
++
++	if (!htotal || htotal > U32_MAX || !vtotal || max_vtotal < vtotal)
++		return -EINVAL;
++	if (check_mul_overflow((u32)htotal, max_vtotal, &max_period))
++		return -EOVERFLOW;
++
++	DPU_REG_WRITE(&intf->hw, INTF_AVR_VTOTAL, max_period);
++	return 0;
++}
++
++static void dpu_hw_intf_enable_avr(struct dpu_hw_intf *intf, bool enable)
++{
++	/*
++	 * Match downstream's continuous QSync mode, without one-shot,
++	 * AVR-step, infinite-idle or hardware-fence trigger extensions.
++	 */
++	DPU_REG_WRITE(&intf->hw, INTF_AVR_CONTROL, enable ? BIT(0) : 0);
++	DPU_REG_WRITE(&intf->hw, INTF_AVR_MODE, 0);
++}
++
++static void dpu_hw_intf_trigger_avr(struct dpu_hw_intf *intf)
++{
++	/* Trigger only after the frame's CTL flush has been issued. */
++	DPU_REG_WRITE(&intf->hw, INTF_AVR_TRIGGER, 1);
++}
++
+ static void dpu_hw_intf_enable_timing_engine(
+ 		struct dpu_hw_intf *intf,
+ 		u8 enable)
+@@ -647,8 +687,12 @@ struct dpu_hw_intf *dpu_hw_intf_init(struct drm_device *dev,
+ 	c->mdss_ver = mdss_rev;
+ 
+ 	c->ops.setup_timing_gen = dpu_hw_intf_setup_timing_engine;
+-	if (mdss_rev->core_major_ver == 12 && cfg->type == INTF_DSI)
++	if (mdss_rev->core_major_ver == 12 && cfg->type == INTF_DSI) {
+ 		c->ops.update_vtotal = dpu_hw_intf_update_vtotal;
++		c->ops.setup_avr = dpu_hw_intf_setup_avr;
++		c->ops.enable_avr = dpu_hw_intf_enable_avr;
++		c->ops.trigger_avr = dpu_hw_intf_trigger_avr;
++	}
+ 	c->ops.setup_prg_fetch  = dpu_hw_intf_setup_prg_fetch;
+ 	c->ops.get_status = dpu_hw_intf_get_status;
+ 	c->ops.enable_timing = dpu_hw_intf_enable_timing_engine;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
+index 039c114bc..f92743b17 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
+@@ -59,6 +59,9 @@ struct dpu_hw_intf_cmd_mode_cfg {
+ /**
+  * struct dpu_hw_intf_ops : Interface to the interface Hw driver functions
+  *  Assumption is these functions will be called after clocks are enabled
++ * @setup_avr: programs the maximum frame period for continuous AVR
++ * @enable_avr: enables/disables continuous AVR; caller must flush INTF
++ * @trigger_avr: releases the pending AVR frame after CTL flush
+  * @setup_timing_gen : programs the timing engine
+  * @setup_prg_fetch  : enables/disables the programmable fetch logic
+  * @enable_timing: enable/disable timing engine
+@@ -78,6 +81,10 @@ struct dpu_hw_intf_cmd_mode_cfg {
+  * @program_intf_cmd_cfg:       Program the DPU to interface datapath for command mode
+  */
+ struct dpu_hw_intf_ops {
++	int (*setup_avr)(struct dpu_hw_intf *intf,
++			 const struct dpu_hw_intf_timing_params *p, u32 max_vtotal);
++	void (*enable_avr)(struct dpu_hw_intf *intf, bool enable);
++	void (*trigger_avr)(struct dpu_hw_intf *intf);
+ 	void (*update_vtotal)(struct dpu_hw_intf *intf, u32 vtotal);
+ 	void (*setup_timing_gen)(struct dpu_hw_intf *intf,
+ 			const struct dpu_hw_intf_timing_params *p,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+index d8acad21c..733086a02 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -464,6 +464,27 @@ static int dpu_kms_check_mode_changed(struct msm_kms *kms, struct drm_atomic_com
+ 	return 0;
+ }
+ 
++static void dpu_kms_prepare_commit(struct msm_kms *kms,
++				   struct drm_atomic_commit *state)
++{
++	struct drm_crtc_state *old_state, *new_state;
++	struct drm_crtc *crtc;
++	struct drm_encoder *encoder;
++	int i, ret;
++
++	for_each_oldnew_crtc_in_state(state, crtc, old_state, new_state, i) {
++		u32 max_vtotal = to_dpu_crtc_state(new_state)->avr_max_vtotal;
++
++		drm_for_each_encoder_mask(encoder, to_dpu_kms(kms)->dev, old_state->encoder_mask) {
++			ret = dpu_encoder_prepare_vrr(encoder, max_vtotal,
++					    drm_atomic_crtc_needs_modeset(new_state));
++			if (ret)
++				DRM_ERROR("encoder %u AVR exit failed: %d\n",
++					  encoder->base.id, ret);
++		}
++	}
++}
++
+ static void dpu_kms_flush_commit(struct msm_kms *kms, unsigned crtc_mask)
+ {
+ 	struct dpu_kms *dpu_kms = to_dpu_kms(kms);
+@@ -1084,6 +1105,7 @@ static const struct msm_kms_funcs kms_funcs = {
+ 	.enable_commit   = dpu_kms_enable_commit,
+ 	.disable_commit  = dpu_kms_disable_commit,
+ 	.check_mode_changed = dpu_kms_check_mode_changed,
++	.prepare_commit  = dpu_kms_prepare_commit,
+ 	.flush_commit    = dpu_kms_flush_commit,
+ 	.wait_flush      = dpu_kms_wait_flush,
+ 	.complete_commit = dpu_kms_complete_commit,
+diff --git a/drivers/gpu/drm/msm/dsi/dsi.h b/drivers/gpu/drm/msm/dsi/dsi.h
+index 9ce5252e3..693b14ac2 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi.h
++++ b/drivers/gpu/drm/msm/dsi/dsi.h
+@@ -70,6 +70,8 @@ void msm_dsi_host_cmd_xfer_commit(struct mipi_dsi_host *host,
+ 					u32 dma_base, u32 len);
+ int msm_dsi_host_enable(struct mipi_dsi_host *host);
+ int msm_dsi_host_enable_video(struct mipi_dsi_host *host);
++int msm_dsi_hosts_set_avr(struct mipi_dsi_host *master,
++			  struct mipi_dsi_host *slave, bool enable);
+ void msm_dsi_host_update_vfp(struct mipi_dsi_host *host,
+ 			    const struct drm_display_mode *mode, bool stage);
+ int msm_dsi_host_disable_video(struct mipi_dsi_host *host);
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index a3d0e7795..f7fce0678 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -187,6 +187,7 @@ struct msm_dsi_host {
+ 	bool power_on;
+ 	bool enabled;
+ 	bool video_enabled;
++	bool avr_enabled;
+ 	int irq;
+ };
+ 
+@@ -843,6 +844,8 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
+ 		data |= DSI_VID_CFG0_TRAFFIC_MODE(dsi_get_traffic_mode(flags));
+ 		data |= DSI_VID_CFG0_DST_FORMAT(dsi_get_vid_fmt(mipi_fmt));
+ 		data |= DSI_VID_CFG0_VIRT_CHANNEL(msm_host->channel);
++		if (msm_host->avr_enabled)
++			data |= DSI_VID_CFG0_AVR_SUPPORT_ENABLE;
+ 		if (msm_dsi_host_is_wide_bus_enabled(&msm_host->base))
+ 			data |= DSI_VID_CFG0_DATABUS_WIDEN;
+ 		dsi_write(msm_host, REG_DSI_VID_CFG0, data);
+@@ -2684,12 +2687,72 @@ int msm_dsi_host_power_off(struct mipi_dsi_host *host)
+ 	DBG("-");
+ 
+ 	msm_host->power_on = false;
++	msm_host->avr_enabled = false;
+ 
+ unlock_ret:
+ 	mutex_unlock(&msm_host->dev_mutex);
+ 	return 0;
+ }
+ 
++/* Caller holds the CRTC commit serialization and both active link references. */
++static int dsi_host_check_avr(struct msm_dsi_host *msm_host)
++{
++	if (msm_host->cfg_hnd->major != MSM_DSI_VER_MAJOR_6G ||
++	    msm_host->cfg_hnd->minor != MSM_DSI_6G_VER_MINOR_V2_9_0 ||
++	    !(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO))
++		return -EOPNOTSUPP;
++
++	if (!msm_host->power_on || !msm_host->enabled)
++		return -EPIPE;
++
++	return 0;
++}
++
++static void dsi_host_write_avr(struct msm_dsi_host *msm_host, bool enable)
++{
++	u32 data = dsi_read(msm_host, REG_DSI_VID_CFG0);
++
++	if (enable)
++		data |= DSI_VID_CFG0_AVR_SUPPORT_ENABLE;
++	else
++		data &= ~DSI_VID_CFG0_AVR_SUPPORT_ENABLE;
++	dsi_write(msm_host, REG_DSI_VID_CFG0, data);
++	msm_host->avr_enabled = enable;
++}
++
++int msm_dsi_hosts_set_avr(struct mipi_dsi_host *master,
++			  struct mipi_dsi_host *slave, bool enable)
++{
++	struct msm_dsi_host *first = to_msm_dsi_host(master);
++	struct msm_dsi_host *second = slave ? to_msm_dsi_host(slave) : NULL;
++	int ret;
++
++	/* The manager always passes the clock master before the clock slave. */
++	mutex_lock(&first->dev_mutex);
++	if (second)
++		mutex_lock_nested(&second->dev_mutex, SINGLE_DEPTH_NESTING);
++
++	/* Check both links before changing either controller's receiver state. */
++	ret = dsi_host_check_avr(first);
++	if (ret)
++		goto unlock;
++	if (second) {
++		ret = dsi_host_check_avr(second);
++		if (ret)
++			goto unlock;
++	}
++
++	dsi_host_write_avr(first, enable);
++	if (second)
++		dsi_host_write_avr(second, enable);
++
++unlock:
++	if (second)
++		mutex_unlock(&second->dev_mutex);
++	mutex_unlock(&first->dev_mutex);
++	return ret;
++}
++
+ /*
+  * SM8750 video timing shadow registers, as used by the downstream
+  * dsi_ctrl_async_timing_update()/dsi_ctrl_timing_db_update() sequence.
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_manager.c b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+index db26f5174..1ebc6fa8f 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_manager.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+@@ -61,6 +61,22 @@ void msm_dsi_update_vfp(struct msm_dsi *dsi,
+ 	}
+ }
+ 
++int msm_dsi_set_avr(struct msm_dsi *dsi, bool enable)
++{
++	struct msm_dsi *master = dsi_mgr_get_dsi(DSI_CLOCK_MASTER);
++	struct msm_dsi *slave = dsi_mgr_get_dsi(DSI_CLOCK_SLAVE);
++
++	if (IS_BONDED_DSI()) {
++		if (!master || !slave)
++			return -ENODEV;
++		return msm_dsi_hosts_set_avr(master->host, slave->host, enable);
++	}
++
++	if (!dsi)
++		return -ENODEV;
++	return msm_dsi_hosts_set_avr(dsi->host, NULL, enable);
++}
++
+ static int dsi_mgr_parse_of(struct device_node *np, int id)
+ {
+ 	struct msm_dsi_manager *msm_dsim = &msm_dsim_glb;
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index a0e76c37a..ece29cccd 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -301,6 +301,7 @@ bool msm_dsi_is_cmd_mode(struct msm_dsi *msm_dsi);
+ bool msm_dsi_is_bonded_dsi(struct msm_dsi *msm_dsi);
+ bool msm_dsi_is_master_dsi(struct msm_dsi *msm_dsi);
+ bool msm_dsi_wide_bus_enabled(struct msm_dsi *msm_dsi);
++int msm_dsi_set_avr(struct msm_dsi *dsi, bool enable);
+ void msm_dsi_update_vfp(struct msm_dsi *dsi,
+ 			const struct drm_display_mode *mode, bool stage);
+ struct drm_dsc_config *msm_dsi_get_dsc_config(struct msm_dsi *msm_dsi);
+@@ -338,6 +339,11 @@ static inline bool msm_dsi_wide_bus_enabled(struct msm_dsi *msm_dsi)
+ 	return false;
+ }
+ 
++static inline int msm_dsi_set_avr(struct msm_dsi *dsi, bool enable)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline void msm_dsi_update_vfp(struct msm_dsi *dsi,
+ 				     const struct drm_display_mode *mode, bool stage)
+ {
+diff --git a/drivers/gpu/drm/msm/registers/display/dsi.xml b/drivers/gpu/drm/msm/registers/display/dsi.xml
+index e40125f75..a9c774ad2 100644
+--- a/drivers/gpu/drm/msm/registers/display/dsi.xml
++++ b/drivers/gpu/drm/msm/registers/display/dsi.xml
+@@ -154,6 +154,7 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
+ 		<bitfield name="HFP_POWER_STOP" pos="24" type="boolean"/>
+ 		<bitfield name="DATABUS_WIDEN" pos="25" type="boolean"/>
+ 		<bitfield name="PULSE_MODE_HSA_HE" pos="28" type="boolean"/>
++		<bitfield name="AVR_SUPPORT_ENABLE" pos="29" type="boolean"/>
+ 	</reg32>
+ 	<reg32 offset="0x0001c" name="VID_CFG1">
+ 		<bitfield name="R_SEL" pos="0" type="boolean"/>
