@@ -18,13 +18,35 @@ RUNTIME_PATHS = {
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+
+def patches(record):
+    if 'patch_series' not in record:
+        return []
+    series = ROOT / record['patch_series']
+    return [(series.parent / entry['file'], entry['sha256'])
+            for entry in json.loads(series.read_text())['patches']]
+
+
 def source_inputs():
+    sources = json.loads((ROOT / 'config/fingerprint.json').read_text())['sources']
+    patch_inputs = {}
+    for record in sources.values():
+        if 'patch_series' in record:
+            series = ROOT / record['patch_series']
+            patch_inputs[record['patch_series']] = digest(series)
+        for path, expected in patches(record):
+            if digest(path) != expected:
+                raise ValueError('Fingerprint patch checksum differs: ' + str(path))
+            patch_inputs[str(path.relative_to(ROOT))] = expected
     return {
         'config_sha256': digest(ROOT / 'config/fingerprint.json'),
         'client_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix.c'),
+        'storage_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix-storage.c'),
+        'storage_header_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix-storage.h'),
         'builder_sha256': digest(Path(__file__)),
         'firmware_manifest_sha256': digest(
             ROOT / 'vendor/firmware/hyperos4-fingerprint/manifest.json'),
+        'patches': patch_inputs,
     }
 
 
@@ -52,9 +74,27 @@ def build(output, flags, emulator=None):
     cfg = json.loads((ROOT / 'config/fingerprint.json').read_text())
     dependencies = {name: source(name, record)
                     for name, record in cfg['sources'].items()}
+    work = output / 'fingerprint'
+    work.mkdir()
+    for name, record in cfg['sources'].items():
+        if not patches(record):
+            continue
+        # Extract the fixed upstream commit; apply changes only in the build tree.
+        destination, archive = work / name, work / (name + '.tar')
+        destination.mkdir()
+        subprocess.run(['git', '-C', dependencies[name], 'archive', '--format=tar',
+                        '--output=' + str(archive.resolve()), record['commit']], check=True)
+        subprocess.run(['tar', '-xf', archive, '-C', destination], check=True)
+        archive.unlink()
+        for path, _expected in patches(record):
+            subprocess.run(['patch', '--batch', '--fuzz=0', '-p1', '-i', path],
+                           cwd=destination, check=True)
+        dependencies[name] = destination
     qtee, mink, qcbor = (dependencies[name] for name in ('quic-teec', 'minkipc', 'qcbor'))
     includes = [qtee / 'libqcomtee/include', qtee / 'libqcomtee/src',
                 mink / 'libminkadaptor/include', mink / 'libminkadaptor/src',
+                mink / 'listeners/libfsservice/gpfs', mink / 'listeners/libfsservice/fs',
+                mink / 'listeners/libfsservice/cmn',
                 qcbor / 'inc']
     originals = [
         qtee / 'libqcomtee/src/qcomtee_object.c',
@@ -66,10 +106,9 @@ def build(output, flags, emulator=None):
         *[qcbor / 'src' / name for name in (
             'UsefulBuf.c', 'qcbor_encode.c', 'qcbor_decode.c',
             'qcbor_err_to_str.c', 'ieee754.c')],
+        ROOT / 'linux/userspace/fingerprint/piano-goodix-storage.c',
         ROOT / 'linux/userspace/fingerprint/piano-goodix.c',
     ]
-    work = output / 'fingerprint'
-    work.mkdir()
     objects = []
     for index, original in enumerate(originals):
         obj = work / (str(index) + '.o')
@@ -77,7 +116,7 @@ def build(output, flags, emulator=None):
                    *['-I' + str(p) for p in includes],
                    '-c', original, '-o', obj]
         # Imported Qualcomm sources retain their own warning policy.
-        if original != originals[-1]:
+        if not original.is_relative_to(ROOT / 'linux/userspace/fingerprint'):
             command = [arg for arg in command if arg != '-Werror']
         subprocess.run(command, check=True)
         objects.append(obj)
@@ -103,7 +142,7 @@ def build(output, flags, emulator=None):
         'source_files': {str(p.relative_to(ROOT)): digest(p) for p in originals},
         'firmware': json.loads(
             (ROOT / 'vendor/firmware/hyperos4-fingerprint/manifest.json').read_text())['files'],
-        'operations': ['info', 'initialize', 'prepare-auth', 'watch', 'list'],
+        'operations': ['info', 'initialize', 'prepare-auth', 'watch', 'list', 'storage-probe'],
         'enrollment_supported': False, 'authentication_supported': False,
     }
     if source_inputs() != inputs:

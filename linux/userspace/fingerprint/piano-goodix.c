@@ -28,6 +28,7 @@
 #include <qcbor/qcbor_decode.h>
 #include <qcbor/qcbor_encode.h>
 #include <qcbor/qcbor_spiffy_decode.h>
+#include "piano-goodix-storage.h"
 
 #define FIRMWARE "/usr/lib/firmware/gfpia.elf"
 #define FIRMWARE_LIMIT (32U * 1024U * 1024U)
@@ -801,29 +802,38 @@ int main(int argc, char **argv)
 	struct client client = { .controller = -1 };
 	struct sensor_geometry geometry = {0};
 	struct template_list templates = {0};
+	struct goodix_storage *storage = NULL;
 	uint32_t sensor_type = 0;
+	int storage_probe = argc >= 2 && !strcmp(argv[1], "storage-probe");
 	int watch = argc >= 2 && !strcmp(argv[1], "watch");
 	int list = argc >= 2 && !strcmp(argv[1], "list");
 	int auth_ready = argc >= 2 && !strcmp(argv[1], "prepare-auth");
 	int initialize = argc >= 2 && (!strcmp(argv[1], "initialize") ||
-				       watch || list || auth_ready);
+				       watch || list || auth_ready || storage_probe);
 	unsigned int seconds = 30;
 	uint32_t user_id = 0;
 	int result;
 
 	if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--help"))) {
 		puts("Usage: piano-fingerprint-ctl info|initialize|prepare-auth|watch [seconds]|list <uid>\n"
+		     "       piano-fingerprint-ctl storage-probe --state-dir <empty-directory> <group>\n"
 		     "Query the real Goodix sensor through UIO and QTEE.\n"
 		     "initialize also reads the sensor's geometry and calibration.\n"
 		     "watch reports sensor event flags for 1-120 seconds (default 30).\n"
-		     "list queries templates in an isolated Linux user profile.\n"
+		     "list queries TA templates without file services.\n"
+		     "storage-probe serves restricted FS/GPFS in an explicit empty Linux directory,\n"
+		     "then initializes and selects a group; it does not enroll, remove or authenticate.\n"
 		     "prepare-auth initializes Keymaster sharing when needed and binds Goodix.\n"
 		     "Enrollment and authentication are not implemented yet.");
 		return 0;
 	}
-	if ((list && argc != 3) ||
+	if (storage_probe && (argc != 5 || strcmp(argv[2], "--state-dir"))) {
+		fputs("storage-probe requires --state-dir <empty-directory> <group>.\n", stderr);
+		return 2;
+	}
+	if (!storage_probe && ((list && argc != 3) ||
 	    (argc != 2 && !((watch || list) && argc == 3)) ||
-	    (!initialize && strcmp(argv[1], "info"))) {
+	    (!initialize && strcmp(argv[1], "info")))) {
 		fputs("Use --help for supported operations.\n", stderr);
 		return 2;
 	}
@@ -836,15 +846,24 @@ int main(int argc, char **argv)
 		}
 		seconds = value;
 	}
-	if (list) {
+	if (list || storage_probe) {
 		char *end;
+		const char *number = argv[storage_probe ? 4 : 2];
 		errno = 0;
-		unsigned long value = strtoul(argv[2], &end, 10);
-		if (errno || !*argv[2] || *end || value >= UINT32_MAX) {
-			fputs("User ID must be an unsigned 32-bit Linux UID.\n", stderr);
+		unsigned long value = strtoul(number, &end, 10);
+		if (errno || !*number || *end || *number == '-' || value >= UINT32_MAX) {
+			fputs("Group must be an unsigned 32-bit ID.\n", stderr);
 			return 2;
 		}
 		user_id = value;
+	}
+	if (storage_probe) {
+		result = goodix_storage_open(argv[3], &storage);
+		if (result) {
+			fprintf(stderr, "Cannot start restricted FS/GPFS: %s (%d)\n",
+				strerror(-result), result);
+			return 1;
+		}
 	}
 	result = open_client(&client);
 	if (!result)
@@ -859,12 +878,23 @@ int main(int argc, char **argv)
 		result = watch_events(&client, seconds);
 	if (!result && list)
 		result = select_linux_group(&client, user_id);
+	if (!result && storage_probe) {
+		uint8_t *payload = client.shared;
+		const char path[] = "/data/vendor_de/0/fpdata";
+		memset(payload, 0, client.shared_size);
+		memcpy(payload + 0x6c, &user_id, sizeof(user_id));
+		memcpy(payload + 0x70, path, sizeof(path));
+		result = sensor_command(&client, 1014, 0x270);
+	}
 	if (!result && list)
 		result = enumerate_templates(&client, geometry.max_templates, &templates);
 	int closed = close_client(&client);
+	goodix_storage_close(storage);
 	if (!result)
 		result = closed;
-	if (!result && list) {
+	if (!result && storage_probe)
+		puts("{\"storage_probe_ok\":true,\"authentication_supported\":false}");
+	else if (!result && list) {
 		printf("{\"user_id\":%u,\"template_count\":%zu,\"templates\":[",
 		       user_id, templates.count);
 		for (size_t i = 0; i < templates.count; i++)
