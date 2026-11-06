@@ -780,10 +780,7 @@ static int watch_events(struct client *client, unsigned int seconds)
 		.buffer = client->shared, .buffer_size = client->shared_size,
 	};
 	struct sigaction action = { .sa_handler = stop_watching }, previous_int, previous_term;
-	int result = goodix_events_start(&events);
-	int handlers = 0, stopped;
-	if (result)
-		return result;
+	int result, handlers = 0, stopped;
 	interrupted = 0;
 	sigemptyset(&action.sa_mask);
 	if (sigaction(SIGINT, &action, &previous_int)) {
@@ -796,6 +793,9 @@ static int watch_events(struct client *client, unsigned int seconds)
 		goto cancel;
 	}
 	handlers = 2;
+	result = goodix_events_start(&events);
+	if (result || interrupted)
+		goto cancel;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	fprintf(stderr, "Sensor ready; watching interrupts for %u seconds.\n", seconds);
 	while (!interrupted) {
@@ -834,17 +834,19 @@ static int watch_events(struct client *client, unsigned int seconds)
 					      stderr);
 				break;
 			}
-			printf("{\"irq_count\":%u,\"sensor_events\":%u,\"operation\":%u,"
+			if (printf("{\"irq_count\":%u,\"sensor_events\":%u,\"operation\":%u,"
 			       "\"phase\":%u,\"application_status\":%d}\n",
 			       counter, sample.mask, sample.operation, sample.phase,
-			       sample.application_status);
-			fflush(stdout);
+			       sample.application_status) < 0 || fflush(stdout) == EOF) {
+				result = -errno;
+				break;
+			}
 			clock_gettime(CLOCK_MONOTONIC, &now);
 			remaining = (int64_t)seconds * 1000 -
 				((now.tv_sec - start.tv_sec) * 1000 +
 				 (now.tv_nsec - start.tv_nsec) / 1000000);
 		} while (result == 1 && remaining > 0 && !interrupted);
-		if (result)
+		if (result || remaining <= 0 || interrupted)
 			break;
 		if (write(client->controller, &enable, sizeof(enable)) != sizeof(enable)) {
 			result = -EIO;
@@ -933,6 +935,8 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
+	/* A closed output pipe must not bypass sensor cancellation or teardown. */
+	signal(SIGPIPE, SIG_IGN);
 	result = open_client(&client);
 	if (!result)
 		result = device_info(&client, &sensor_type);
