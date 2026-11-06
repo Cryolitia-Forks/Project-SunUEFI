@@ -11,7 +11,14 @@ enum goodix_events_state {
 	GOODIX_EVENTS_IDLE,
 	GOODIX_EVENTS_WAIT_IRQ,
 	GOODIX_EVENTS_DRAIN,
+	GOODIX_EVENTS_RETRY,
 	GOODIX_EVENTS_FAILED,
+};
+
+enum goodix_capture_state {
+	GOODIX_CAPTURE_NONE,
+	GOODIX_CAPTURE_PENDING,
+	GOODIX_CAPTURE_ADVANCED,
 };
 
 /* Sensor metadata only. An interrupt or event mask is never a match result. */
@@ -33,12 +40,21 @@ struct goodix_events {
 	uint8_t *buffer;
 	size_t buffer_size;
 	enum goodix_events_state state;
+	enum goodix_capture_state capture_state;
 };
 
 int goodix_events_start(struct goodix_events *events);
 
 /* Call after consuming a UIO IRQ, then again while the result is 1.
  * A zero result completes that IRQ; only then may the caller re-enable it.
+ * Each call performs one command, so the caller can check cancellation and
+ * its deadline between continuations. Only the ordinary event packet is used;
+ * enrollment's optional extended packet is not supported by this watcher.
+ * Image-result metadata is not an authentication decision. Group, template ID,
+ * image data and HAT remain private to the shared buffer and are not returned.
+ * An image result with status 0 and authentication operation 1/2/4 returns
+ * -EOPNOTSUPP: its required authentication-finish exchange is not implemented.
+ * The watcher must cancel it rather than acknowledge it or re-enable the IRQ.
  * Negative results require cancel/close, not a synthetic authentication result.
  */
 int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event *event);

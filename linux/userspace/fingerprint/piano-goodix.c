@@ -348,25 +348,53 @@ static void clear_sensitive(void *buffer, size_t size)
 }
 
 static int keymaster_native_command(Object app, const void *request, size_t size,
-				    uint8_t *response, size_t capacity, size_t *actual)
+				    uint8_t *response, size_t capacity, size_t *actual,
+				    int32_t *status)
 {
 	ObjectArg args[] = {
 		{ .bi = {request, size} }, { .b = {response, capacity} },
 	};
-	int32_t status;
+
+	/* A native TA result may be a positive retry code. Keep it separate
+	 * from transport/framing errors and preserve its opaque reply payload.
+	 */
+	*actual = 0;
+	*status = 0;
 	int result = invoke(app, 0, args, ObjectCounts_pack(1, 1, 0, 0));
 
 	if (result)
 		return result;
-	if (args[1].b.size < sizeof(status) || args[1].b.size > capacity)
+	if (args[1].b.size < sizeof(*status) || args[1].b.size > capacity)
 		return -EMSGSIZE;
-	memcpy(&status, response, sizeof(status));
+	memcpy(status, response, sizeof(*status));
+	*actual = args[1].b.size;
+	return 0;
+}
+
+/* Version negotiation and HMAC sharing require success, unlike a caller
+ * interpreting a native protocol's retry result and accompanying payload.
+ */
+static int keymaster_native_command_strict(Object app, const void *request, size_t size,
+					   uint8_t *response, size_t capacity, size_t *actual)
+{
+	int32_t status;
+	int result = keymaster_native_command(app, request, size, response, capacity,
+					      actual, &status);
+
+	if (result)
+		return result;
 	if (status) {
-		fprintf(stderr, "Keymaster native command %#x: status=%d\n",
-			*(const uint32_t *)request, status);
+		if (size >= sizeof(uint32_t)) {
+			uint32_t opcode;
+
+			memcpy(&opcode, request, sizeof(opcode));
+			fprintf(stderr, "Keymaster native command %#x: status=%d\n", opcode, status);
+		} else {
+			fprintf(stderr, "Keymaster native command: status=%d\n", status);
+		}
+		*actual = 0;
 		return -EREMOTEIO;
 	}
-	*actual = args[1].b.size;
 	return 0;
 }
 
@@ -408,13 +436,13 @@ static int keymaster_sharing_init(struct client *client)
 	if (result)
 		goto done;
 	app = service[1].o;
-	result = keymaster_native_command(app, &version, sizeof(version),
+	result = keymaster_native_command_strict(app, &version, sizeof(version),
 					 response, sizeof(response), &actual);
 	if (!result)
-		result = keymaster_native_command(app, handshake, sizeof(handshake),
+		result = keymaster_native_command_strict(app, handshake, sizeof(handshake),
 						 response, sizeof(response), &actual);
 	if (!result)
-		result = keymaster_native_command(app, &get, sizeof(get),
+		result = keymaster_native_command_strict(app, &get, sizeof(get),
 						 response, sizeof(response), &actual);
 	if (result)
 		goto done;
@@ -450,7 +478,7 @@ static int keymaster_sharing_init(struct client *client)
 		goto done;
 	}
 	/* Preserve the exact CBOR length; padding is not part of this protocol. */
-	result = keymaster_native_command(app, request, encoded.len + 4,
+	result = keymaster_native_command_strict(app, request, encoded.len + 4,
 					 response, sizeof(response), &actual);
 done:
 	clear_sensitive(response, sizeof(response));
@@ -830,7 +858,7 @@ static int watch_events(struct client *client, unsigned int seconds)
 			result = goodix_events_read(&events, &sample);
 			if (result < 0) {
 				if (result == -EOPNOTSUPP)
-					fputs("Sensor requested image processing; the event watch cannot authenticate.\n",
+					fputs("Sensor requested an unsupported exchange; cancelling the event watch.\n",
 					      stderr);
 				break;
 			}
