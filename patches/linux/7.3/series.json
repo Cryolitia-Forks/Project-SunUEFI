@@ -4,8 +4,8 @@
   "kernel_version": "7.3.0",
   "base_commit": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
   "base_tree": "30fd2ef82912c26cf3a58ad0ba6afc375fa851ac",
-  "target_tree": "4235eaae33992f5f353988e2d4eca22c1c94860c",
-  "original_target_commit": "eb385e7e9f7c7f817c967989e2a94877fa96fe8f",
+  "target_tree": "21dee6495a01829e5faa8e5aca0c4dcd8c8c2ff8",
+  "original_target_commit": "986f7e1a38f36c82e5c7108d53fe77b96bc37d23",
   "source_url": "https://github.com/torvalds/linux.git",
   "patches": [
     {
@@ -255,6 +255,14 @@
       "original_parent": "e19647a57227174c8073332871bf978cfa201b51",
       "committer_date": "2026-11-07T00:40:00+08:00",
       "tree": "4235eaae33992f5f353988e2d4eca22c1c94860c"
+    },
+    {
+      "file": "0032-media-camss-frame-timestamps.patch",
+      "sha256": "23bdf32525df8961d1effb465018d5cbc00900f6f6f34ad10bd84fb062bcefd1",
+      "original_commit": "986f7e1a38f36c82e5c7108d53fe77b96bc37d23",
+      "original_parent": "eb385e7e9f7c7f817c967989e2a94877fa96fe8f",
+      "committer_date": "2026-11-07T07:14:52+08:00",
+      "tree": "21dee6495a01829e5faa8e5aca0c4dcd8c8c2ff8"
     }
   ],
   "provenance": {

@@ -7,7 +7,7 @@
     "stable_source": "https://github.com/torvalds/linux.git",
     "stable_commit": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
     "stable_version": "7.3.0",
-    "target_tree": "4235eaae33992f5f353988e2d4eca22c1c94860c",
+    "target_tree": "21dee6495a01829e5faa8e5aca0c4dcd8c8c2ff8",
     "cpu_model_overlay": "linux/dts/piano-cpu-model.dtso",
     "additional_dtb_overlays": [
       "linux/dts/piano-cma.dtso",
