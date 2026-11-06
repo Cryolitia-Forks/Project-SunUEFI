@@ -4,8 +4,8 @@
   "kernel_version": "7.3.0",
   "base_commit": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
   "base_tree": "30fd2ef82912c26cf3a58ad0ba6afc375fa851ac",
-  "target_tree": "4a5923915b4214f850287fc51c658781dc54a195",
-  "original_target_commit": "220cdeac7e4ec4e1a8bc4c2400c71fa00b21b084",
+  "target_tree": "a14578554a1ff12447dd2474aa514a3649622446",
+  "original_target_commit": "a38d4136b268a7a2eae1130b7631991de5b15d2f",
   "source_url": "https://github.com/torvalds/linux.git",
   "patches": [
     {
@@ -199,6 +199,30 @@
       "original_parent": "57b1e6db5a831d416ad438b7490144e6f8ee6af9",
       "committer_date": "2026-10-22T18:25:53+08:00",
       "tree": "4a5923915b4214f850287fc51c658781dc54a195"
+    },
+    {
+      "file": "0025-dt-bindings-ir-spi-piano.patch",
+      "sha256": "37c1cca64465b7d72ea9796adf684bea7e1287b444faf30709ab7f3e3c485d6a",
+      "original_commit": "c8129b3ad19b908f5811f6ec50dcac89be0f9188",
+      "original_parent": "220cdeac7e4ec4e1a8bc4c2400c71fa00b21b084",
+      "committer_date": "2026-11-06T17:53:57+08:00",
+      "tree": "766de95d0061a772b7e390222696ee454f453c38"
+    },
+    {
+      "file": "0026-media-ir-spi-piano.patch",
+      "sha256": "6af87e6a542d28a0a7c7558a47066e73fd10282b6aa7fe67b1d9000b83598cae",
+      "original_commit": "332d36e70fdc2329b975571407c08144fa579df1",
+      "original_parent": "c8129b3ad19b908f5811f6ec50dcac89be0f9188",
+      "committer_date": "2026-11-06T17:53:57+08:00",
+      "tree": "c5c53127c8afdafb0eebca733b6283d57a9f94e3"
+    },
+    {
+      "file": "0027-spi-geni-dma-idle.patch",
+      "sha256": "2b39e58c75ad0d4ffb569099a32862aba3d13112ac1281a23bc172b952e98d95",
+      "original_commit": "a38d4136b268a7a2eae1130b7631991de5b15d2f",
+      "original_parent": "332d36e70fdc2329b975571407c08144fa579df1",
+      "committer_date": "2026-11-06T18:17:15+08:00",
+      "tree": "a14578554a1ff12447dd2474aa514a3649622446"
     }
   ],
   "provenance": {

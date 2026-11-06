@@ -20,25 +20,43 @@ Linux起初没有RGB，LPG的deferred-probe原因为未取得LPG chan SDAM。正
 
 ## 红外发射
 
-原厂最终 DT 的子节点是 `/soc/qcom,qupv3_2_geni_se@8c0000/spi@89c000/ir-spi@0`，最大 SPI 时钟 19.2 MHz， Android 绑定 `ir_spi`。GPIO28/29/30/31 分别是 MISO/MOSI/CLK/CS，复用到 QUP2 SE7。原厂 HAL 清单有 `android.hardware.ir-service.example`。
+Piano 的发送器通过标准 rc-core/LIRC 接口接收脉冲与间隔，设备为
+`/dev/lircN`。无需 Android HAL 或常驻服务，`ir-ctl` 由 v4l-utils 提供。
+发送时可用 `ir-ctl -d /dev/lirc0 --carrier=38000 --send=remote.txt`，文件使用
+ir-ctl 的 `pulse` / `space` 文本格式。接口注册和编译不代表光学输出已经测量；
+首次上机需要核对实际载波、包络以及发送后的熄灭状态。
 
-[固定 MiCode 驱动](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/45fb9bd6ae5ba2942fc1d53e4b6b46ef76992f71/drivers/media/rc/ir-spi.c)注册 `/dev/ir_spi`，以 32 位 SPI word、1.92 MHz 默认时钟发送用户空间提供的原始位图。它把 `LIRC_SET_SEND_MODE` 用作缓冲区长度设置，并没有标准 rc-core 的脉冲/间隔接口。当前 ROM 模块的 probe 反汇编也确认 32 位和 1.92 MHz；不能据 ioctl 名字把它当成标准 LIRC 驱动。
+原厂最终设备树将发送器放在
+`/soc/qcom,qupv3_2_geni_se@8c0000/spi@89c000/ir-spi@0`，即
+SE15 / QUP2 SE7 / CS0。GPIO28/29/30/31 分别为 MISO/MOSI/CLK/CS，
+子设备最大时钟为 19.2 MHz。
+[原厂驱动](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/45fb9bd6ae5ba2942fc1d53e4b6b46ef76992f71/drivers/media/rc/ir-spi.c)
+使用私有 `/dev/ir_spi` 位图接口。Linux 适配保留原厂接线与波形量化，改用
+`xiaomi,piano-ir-spi` 匹配标准 ir-spi 驱动，不要求原厂未描述的供电开关。
 
-原厂服务的 `ConsumerIr::transmit` 只把频率和原始脉冲数组转交给 legacy `consumerir_device_t`，底层返回值随后被忽略并返回AIDL成功，不能据此认定发射完成；这与 [AOSP AIDL 服务](https://android.googlesource.com/platform/hardware/interfaces/+/a2a9fa50039d69643527020ab6706b319f0e6c62/ir/aidl/default/main.cpp)一致。编码位于本ROM的 `/odm/lib64/hw/consumerir.qcom.so`（SHA256 `fc9e6f2c7770b0f5eb765af8e6eec17494ba7a081a47051606188bec17164f9a`），不是服务主二进制。已按目录元数据只提取这两个明确文件；没有执行。该模块是ODM目录consumerir草案，但现有属性采集未包含 `ro.hardware.consumerir`/`ro.hardware`，尚未通过运行时maps确认它被选择。
+原厂 `/odm/lib64/hw/consumerir.qcom.so` 的 SHA256 为
+`fc9e6f2c7770b0f5eb765af8e6eec17494ba7a081a47051606188bec17164f9a`。
+其固定 1.92 MHz 采样时钟、约 40% 默认占空比、原生 32 位 MSB-first
+字序和低电平间隔由编码器保留。载波接受 30–56 kHz，并支持 LIRC 占空比设置。
+38 kHz 请求量化为 51 点周期、20 点高电平，名义载波约 37647 Hz。
+累计时间决定采样边界，不沿用原厂减 5 µs 的时间修正。
 
-`consumerir_transmit_mi`（VA `0x40f8`）以固定 **1.92MHz** 生成波形：周期采样点数为 `round(1920000 / carrier)`，高电平点数为 `floor(2 × period / 5)`。38kHz请求得到51点周期、20高/31低，名义载波约37647Hz。偶数脉冲段调制载波，奇数间隔段全部为0并复位载波计数器。样本从原生little-endian `u32`的bit31向bit0填入，不做byte-swap，由原厂驱动的32位SPI word接口发送；最终写入长度向上对齐1024字节，填充区清零。累积时间边界减5µs、时间转换与长度上限等细节保存在私有 `ir-encoding-facts.json`，不能照搬成无边界检查的实现。
+每次请求须为正值、奇数段、最多 1024 段。缓冲区在完整零 word 后对齐到
+1024 字节，包含填充最多 32 KiB，约能容纳 136 ms 报文；超长返回 `EMSGSIZE`。
+当前 GPI 只接受单个 DMA 段，不能把长报文简单拆成多个 SPI transfer 后
+假定时钟连续。空调等长报文需要先补齐 GPI 的多 TRE 连续传输和完成事件处理。
 
-该HAL只打开 `/dev/ir_spi`、设置传输字节数、写入并关闭，没有GPIO、regulator或额外idle写操作。编码的间隔和填充为低电平，但这不能证明晶体管/光学输出极性，或在无填充的末尾脉冲后控制器最终保持的电平。
+共享 [`设备树`](../../../linux/dts/piano-ir-spi-controller.dtso)沿用原厂
+GCC ID123、GIC SPI462、GPI2 SE7 和 IOMMU 路由。运行与休眠的差异只在
+GPIO29：idle/sleep 状态将 MOSI 主动拉低，其余引脚沿用原厂 GPIO 休眠配置。
+GENI 驱动在消息开始时选择 default，在队列空闲且 SE 确认停止后选择 idle；
+自动休眠选择相同的低电平状态。IR 客户端不直接抢占控制器引脚。
 
-最小标准适配方向是：将控制器转为 `qcom,geni-spi`、时钟名 `se`，逐项按当前GENI/GPI的clock、interconnect、DMA binding转换资源；子节点用 `ir-spi-led`，配置开启 `LIRC` 和 `IR_SPI`。现有产品DT仍是厂商 `qcom,spi-geni` / `se-clk`，不能只替换子节点compatible。标准驱动每个载波使用16个位样本、SPI时钟为载波×16；请求40%占空比时当前公式得到7/16高位，约43.75%，并不等同于原厂1.92MHz量化波形。移植可复用标准rc-core/LIRC接口及已确认的低电平间隔，但需明确是否保留原厂编码、word顺序与约40%占空比。原厂两层均无供电控制，标准驱动的regulator请求仍需按无可控供电接口处理，不能虚构supply或默默依赖dummy regulator。相关标准接口见 [IR SPI绑定](https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/leds/irled/ir-spi-led.yaml)。
-
-[控制器独立草案](../../../linux/dts/piano-ir-spi-controller.dtso)已使用当前内核headers编译并与参考产品DT合并检查，尚未接入产品构建或部署。GCC ID123、GIC SPI462、SE7、GPIO28–31都与原厂最终DT和当前 `sm8750.dtsi` 对应；DMA改为GPI2三cell参数 `0/1,7,SPI`，三个ICC路径使用现有标准provider及两cell参数。新default/sleep pinctrl位于 `piano_tlmm_ml`，保留原厂6mA/2mA、bias-disable，未添加输出电平操作。共享QUP2 wrapper、GPI2掩码和Linux拥有的SID `0x423/0x436`均未改变；同地址I2C节点仍禁用。
-
-该草案只准备标准SPI控制器，现有CS0子节点已改为 `ir-spi-led` 但保持 **disabled**，没有供电、假设备或发射操作。合并检查证明资源能解析，不证明控制器已绑定或完成DMA；下一次正常产品集成后先检查GENI/SPI provider绑定及probe日志，不写SPI数据。当前GENI驱动会检查SE协议和FIFO状态，必要时加载SPI固件或取得GPI通道，因此仍可能报告协议/固件/依赖错误。属性差异保存在私有 `ir-controller-overlay-review.json`；未声称整份继承厂商DT通过上游schema校验。
-
-[标准发送驱动草案](../../../patches/linux/7.2.9/drafts/piano-ir-spi-rc-core.patch)在现有 `ir-spi` 内新增显式 `xiaomi,piano-ir-spi` 设备分支，使用rc-core/LIRC回调及 `spi_sync_transfer()`，没有用户空间直接MMIO或私有发送syscall。原有 `ir-spi-led` 的16位编码和供电请求保持原样。Piano分支默认40%占空比、固定1.92MHz、native 32-bit MSB-first打包；载波限制到原厂声明范围30–56kHz，LIRC占空比请求按采样分辨率检查。不存在的可控供电不请求dummy regulator，也不添加supply。
-
-输入按正常LIRC脉冲/间隔解释：必须为正值、奇数个、最多1024段，总时长不超过rc-core的1秒上限。采用累计时间量化，保留请求时长，不复制原厂减5µs或负值处理。对齐前额外保留一个零word，使最后一个SPI word必定为低电平；完成和失败使用SPI核心返回结果。草案已在独立副本用当前ARM64编译参数生成对象，并通过 `git apply --check`；未构建完整模块、未做schema校验、未接入配置或产品DT、未部署或发射。控制器草案仍保持原样和child disabled；未来启用时必须同时接入新compatible、LIRC/IR_SPI配置与模块打包，再验证SPI和光学行为。
+发送超时后，GENI 必须等两路 GPI 通道确认终止才返回 SPI 核心，避免核心
+提前解除仍被 DMA 使用的缓冲区映射。终止失败时保留消息、映射、时钟和引脚，
+继续恢复；不把超时当成硬件已停止。以上改动分别在 Linux 7.3
+[`series.json`](../../../patches/linux/7.3/series.json) 的 0025–0027 中维护，
+`RC_CORE`、`LIRC` 和 `IR_SPI` 配置由共享平台片段启用。
 
 ## 侧指纹
 
