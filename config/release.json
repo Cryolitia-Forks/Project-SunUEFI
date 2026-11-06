@@ -7,7 +7,7 @@
     "stable_source": "https://github.com/torvalds/linux.git",
     "stable_commit": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
     "stable_version": "7.3.0",
-    "target_tree": "a14578554a1ff12447dd2474aa514a3649622446",
+    "target_tree": "6dde6991e0d0bb9be8984e770dad1d6372c420d2",
     "cpu_model_overlay": "linux/dts/piano-cpu-model.dtso",
     "additional_dtb_overlays": [
       "linux/dts/piano-cma.dtso",
@@ -20,6 +20,7 @@
       "linux/dts/piano-board-identity.dtso",
       "linux/dts/piano-regdma-resource.dtso",
       "linux/dts/piano-audio-dmic-clock.dtso",
+      "linux/dts/piano-camera-sensors.dtso",
       "linux/dts/piano-camera-flash.dtso",
       "linux/dts/piano-camera-privacy-led.dtso",
       "linux/dts/piano-touch-panel.dtso",

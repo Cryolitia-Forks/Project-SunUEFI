@@ -1,0 +1,584 @@
+From: Cryolitia PukNgae <cryolitia@gmail.com>
+Subject: [PATCH] camera: negotiate output sizes and frame intervals through V4L2
+
+Select real sensor modes through application S_FMT/S_PARM, propagate the
+returned sensor geometry, and configure an aspect-preserving TFE crop.
+Use standard VT timing controls for the rear sensor's requested frame rate
+and exposure. Keep the 1920x1440 default and two physical camera entries.
+
+---
+--- a/camera/piano-camerad.c
++++ b/camera/piano-camerad.c
+@@ -60,6 +60,19 @@
+ #define DEF_SATURATION	100	/* percent */
+ #define DEF_CONTRAST	96	/* S curve share of the tone curve, of 256 */
+ 
++struct capture_mode {
++	unsigned int width, height, fps;
++};
++
++static const struct capture_mode rear_modes[] = {
++	{ 4080, 3060, 30 }, { 4080, 2296, 30 },
++	{ 3840, 2160, 60 }, { 8160, 6120, 10 },
++};
++
++static const struct capture_mode front_modes[] = {
++	{ 3264, 2448, 30 }, { 3264, 1836, 30 }, { 6528, 4896, 10 },
++};
++
+ struct cam_cfg {
+ 	const char *name;
+ 	const char *label;	/* v4l2loopback card label */
+@@ -71,6 +84,9 @@
+ 	const char *vcm;	/* focus actuator entity prefix, or NULL */
+ 	unsigned int in_w, in_h;	/* sensor mode */
+ 	unsigned int out_w, out_h;	/* ISP output (MN downscaler) */
++	unsigned int max_out_w, max_out_h;
++	const struct capture_mode *modes;
++	unsigned int num_modes;
+ 	bool hflip, vflip;	/* sensor readout flips for an upright image */
+ 	int again_unit;		/* analogue gain control value for 1x */
+ 	double fps;
+@@ -80,17 +96,15 @@
+ /* qcom-camss PIX line control: colour correction matrix, 3x3 s32, Q10 */
+ #define V4L2_CID_CAMSS_CCM	(V4L2_CID_USER_BASE | 0x1ff0)
+ 
+-/*
+- * TODO: configurable output size (per camera, e.g. from /etc/piano/camera.conf,
+- * or several sizes offered on the loopback device); fixed at 1920x1440 now.
+- */
+ static const struct cam_cfg cam_cfgs[] = {
+ 	{
+ 		.name = "rear", .label = "Rear Camera",
+ 		.sensor = "s5kjn1", .phy = "msm_csiphy1",
+ 		.csid = "msm_csid0", .vfe = "msm_vfe0_pix",
+ 		.video = "msm_vfe0_video3", .vcm = "dw9768",
+-		.in_w = 4080, .in_h = 3072, .out_w = 1920, .out_h = 1440,
++		.in_w = 4080, .in_h = 3060, .out_w = 1920, .out_h = 1440,
++		.max_out_w = 4080, .max_out_h = 3060,
++		.modes = rear_modes, .num_modes = sizeof(rear_modes) / sizeof(*rear_modes),
+ 		.vflip = true, .again_unit = 1, .fps = 30,
+ 		/* mean of the stock tuning matrices */
+ 		.ccm = { 1732, -667, -40, -230, 1337, -82, -93, -989, 2106 },
+@@ -101,6 +115,8 @@
+ 		.csid = "msm_csid1", .vfe = "msm_vfe1_pix",
+ 		.video = "msm_vfe1_video3",
+ 		.in_w = 3264, .in_h = 2448, .out_w = 1920, .out_h = 1440,
++		.max_out_w = 3264, .max_out_h = 2448,
++		.modes = front_modes, .num_modes = sizeof(front_modes) / sizeof(*front_modes),
+ 		.again_unit = 256, .fps = 30,
+ 		.ccm = { 1649, -375, -251, -245, 1525, -255, -169, -308, 1501 },
+ 	},
+@@ -116,6 +132,7 @@
+ #define AF_HIST		64	/* sharpness samples kept per scan */
+ 
+ struct cam {
++	struct cam_cfg mode;
+ 	const struct cam_cfg *cfg;
+ 	int loop_fd;
+ 	bool streaming;
+@@ -151,6 +168,7 @@
+ 
+ static struct cam cams[NUM_CAMS];
+ static volatile sig_atomic_t quit;
++static int exit_status;
+ static double srgb_lin[256];
+ static int saturation = DEF_SATURATION * SAT_UNITY / 100;
+ static int contrast = DEF_CONTRAST;
+@@ -383,6 +401,29 @@
+ 	return f.format.width == w && f.format.height == h ? 0 : -1;
+ }
+ 
++/* Raw sensors select the nearest hardware mode. Propagate that returned size
++ * through CAMSS instead of assuming that every kernel uses identical tables.
++ */
++static int sensor_format(struct cam *c, uint32_t *code)
++{
++	struct v4l2_subdev_format f = {
++		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
++		.pad = 0,
++		.format = { .width = c->cfg->in_w, .height = c->cfg->in_h },
++	};
++
++	if (xioctl(c->sensor_fd, VIDIOC_SUBDEV_G_FMT, &f) < 0)
++		return -1;
++	f.format.width = c->cfg->in_w;
++	f.format.height = c->cfg->in_h;
++	if (xioctl(c->sensor_fd, VIDIOC_SUBDEV_S_FMT, &f) < 0)
++		return -1;
++	c->mode.in_w = f.format.width;
++	c->mode.in_h = f.format.height;
++	*code = f.format.code;
++	return 0;
++}
++
+ static int ctrl_set(int fd, uint32_t id, int val)
+ {
+ 	struct v4l2_control c = { .id = id, .value = val };
+@@ -493,27 +534,16 @@
+ 	return ret;
+ }
+ 
+-static int loopback_init(struct cam *c)
+-{
+-	const struct cam_cfg *cfg = c->cfg;
++static int loopback_format(struct cam *c, unsigned int width, unsigned int height)
++{
+ 	struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
+-	struct v4l2_streamparm p = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
+-	struct v4l2_event_subscription sub = {
+-		.type = V4L2_EVENT_PRI_CLIENT_USAGE,
+-	};
+-	size_t size = frame_size(cfg);
+-
+-	c->loop_fd = open_loopback(cfg->label);
+-	if (c->loop_fd < 0) {
+-		logmsg(c, "no v4l2loopback device \"%s\"", cfg->label);
+-		return -1;
+-	}
+-
+-	f.fmt.pix.width = cfg->out_w;
+-	f.fmt.pix.height = cfg->out_h;
++	size_t size = (size_t)width * height * 3 / 2;
++
++	f.fmt.pix.width = width;
++	f.fmt.pix.height = height;
+ 	f.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+ 	f.fmt.pix.field = V4L2_FIELD_NONE;
+-	f.fmt.pix.bytesperline = cfg->out_w;
++	f.fmt.pix.bytesperline = width;
+ 	f.fmt.pix.sizeimage = size;
+ 	/* full range BT.601 YCbCr, sRGB transfer */
+ 	f.fmt.pix.colorspace = V4L2_COLORSPACE_JPEG;
+@@ -523,28 +553,84 @@
+ 		return -1;
+ 	}
+ 	if (f.fmt.pix.pixelformat != V4L2_PIX_FMT_NV12 ||
+-	    f.fmt.pix.width != cfg->out_w || f.fmt.pix.height != cfg->out_h ||
+-	    f.fmt.pix.bytesperline != cfg->out_w || f.fmt.pix.sizeimage != size) {
+-		logmsg(c, "loopback did not accept tightly packed NV12 %ux%u", cfg->out_w,
+-		       cfg->out_h);
+-		return -1;
+-	}
+-
+-	p.parm.output.timeperframe.numerator = 1;
+-	p.parm.output.timeperframe.denominator = (unsigned int)cfg->fps;
+-	xioctl(c->loop_fd, VIDIOC_S_PARM, &p);
+-
+-	if (xioctl(c->loop_fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0) {
+-		logmsg(c, "loopback client usage events: %s", strerror(errno));
+-		return -1;
+-	}
++	    f.fmt.pix.width != width || f.fmt.pix.height != height ||
++	    f.fmt.pix.bytesperline != width || f.fmt.pix.sizeimage != size) {
++		logmsg(c, "loopback did not accept tightly packed NV12 %ux%u", width,
++		       height);
++		return -1;
++	}
++	return 0;
++}
++
++static int loopback_rate(struct cam *c, unsigned int fps)
++{
++	struct v4l2_streamparm p = {
++		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT,
++		.parm.output.timeperframe = { .numerator = 1, .denominator = fps },
++	};
++
++	if (xioctl(c->loop_fd, VIDIOC_S_PARM, &p) < 0)
++		return -1;
++	if ((uint64_t)p.parm.output.timeperframe.numerator * fps !=
++	    p.parm.output.timeperframe.denominator) {
++		errno = ERANGE;
++		return -1;
++	}
++	return 0;
++}
++
++static int select_capture_mode(struct cam_cfg *cfg, unsigned int width,
++			       unsigned int height, unsigned int fps)
++{
++	for (unsigned int i = 0; i < cfg->num_modes; ++i) {
++		const struct capture_mode *mode = &cfg->modes[i];
++
++		if (mode->fps != fps || width > mode->width || height > mode->height)
++			continue;
++		cfg->in_w = cfg->max_out_w = mode->width;
++		cfg->in_h = cfg->max_out_h = mode->height;
++		cfg->out_w = width;
++		cfg->out_h = height;
++		cfg->fps = fps;
++		return 0;
++	}
++	errno = EINVAL;
++	return -1;
++}
++
++static int loopback_init(struct cam *c)
++{
++	const struct cam_cfg *cfg = c->cfg;
++	struct v4l2_event_subscription sub = {
++		.type = V4L2_EVENT_PRI_CLIENT_USAGE,
++	};
++	struct v4l2_event_subscription changes = { .type = V4L2_EVENT_SOURCE_CHANGE };
++
++	c->loop_fd = open_loopback(cfg->label);
++	if (c->loop_fd < 0) {
++		logmsg(c, "no v4l2loopback device \"%s\"", cfg->label);
++		return -1;
++	}
++	/* Before the first frame, register each sensor mode's size and interval.
++	 * Readers then use ordinary V4L2 S_FMT/S_PARM, not a second camera entry.
++	 */
++	for (unsigned int i = 0; i < cfg->num_modes; ++i) {
++		const struct capture_mode *mode = &cfg->modes[i];
++
++		if (loopback_format(c, mode->width, mode->height) < 0 ||
++		    loopback_rate(c, mode->fps) < 0 ||
++		    xioctl(c->loop_fd, VIDIOC_SUBSCRIBE_EVENT, &changes) < 0)
++			return -1;
++	}
++	if (loopback_format(c, cfg->out_w, cfg->out_h) < 0 ||
++	    loopback_rate(c, (unsigned int)cfg->fps) < 0 ||
++	    xioctl(c->loop_fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0)
++		return -1;
+ 
+ 	/* one black frame: the device turns into a capture device */
+ 	if (loopback_black(c) < 0)
+-		logmsg(c, "loopback write: %s", strerror(errno));
+-
++		return -1;
+ 	loopback_uevent(c->loop_fd);
+-
+ 	return 0;
+ }
+ 
+@@ -566,7 +652,7 @@
+ 		 (int)lround(c->bgain * WB_UNITY));
+ }
+ 
+-static void cam_stop(struct cam *c)
++static int cam_stop(struct cam *c)
+ {
+ 	struct v4l2_requestbuffers rb = {
+ 		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+@@ -575,7 +661,10 @@
+ 	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+ 
+ 	if (c->vid_fd >= 0) {
+-		xioctl(c->vid_fd, VIDIOC_STREAMOFF, &type);
++		if (xioctl(c->vid_fd, VIDIOC_STREAMOFF, &type) < 0 && c->streaming) {
++			logmsg(c, "STREAMOFF: %s; retaining capture buffers", strerror(errno));
++			return -1;
++		}
+ 		for (int i = 0; i < NUM_BUFS; i++)
+ 			if (c->bufs[i].ptr)
+ 				munmap(c->bufs[i].ptr, c->bufs[i].len);
+@@ -598,6 +687,83 @@
+ 	if (c->streaming)
+ 		logmsg(c, "stopped after %lu frames", c->frames);
+ 	c->streaming = false;
++	return 0;
++}
++
++/* Scale the whole sensor image with a common aspect ratio, then crop in the
++ * scaled YUV image. The TFE has at most 16x downscaling and a 16-pixel write
++ * alignment. Very small outputs therefore crop within its minimum-size image.
++ */
++static int isp_geometry(const struct cam_cfg *cfg, struct v4l2_rect *compose,
++			struct v4l2_rect *crop)
++{
++	uint64_t width = cfg->out_w, height = cfg->out_h;
++
++	if (!width || !height || width > cfg->max_out_w || height > cfg->max_out_h ||
++	    (width & 15) || (height & 1))
++		return -1;
++	if (width * cfg->in_h < height * cfg->in_w)
++		width = (height * cfg->in_w + cfg->in_h - 1) / cfg->in_h;
++	else
++		height = (width * cfg->in_h + cfg->in_w - 1) / cfg->in_w;
++	if (width * 16 < cfg->in_w) {
++		width = (cfg->in_w + 15) / 16;
++		height = (width * cfg->in_h + cfg->in_w - 1) / cfg->in_w;
++	}
++	if (height * 16 < cfg->in_h) {
++		height = (cfg->in_h + 15) / 16;
++		width = (height * cfg->in_w + cfg->in_h - 1) / cfg->in_h;
++	}
++	width = (width + 1) & ~UINT64_C(1);
++	height = (height + 1) & ~UINT64_C(1);
++	*compose = (struct v4l2_rect){ .width = width, .height = height };
++	*crop = (struct v4l2_rect){
++		.left = ((width - cfg->out_w) / 2) & ~UINT64_C(1),
++		.top = ((height - cfg->out_h) / 2) & ~UINT64_C(1),
++		.width = cfg->out_w, .height = cfg->out_h,
++	};
++	return 0;
++}
++
++static int sensor_frame_rate(struct cam *c)
++{
++	struct v4l2_control blank = { .id = V4L2_CID_HBLANK };
++	struct v4l2_ext_control rate = { .id = V4L2_CID_PIXEL_RATE };
++	struct v4l2_ext_controls controls = { .count = 1, .controls = &rate };
++	struct v4l2_query_ext_ctrl vertical = { .id = V4L2_CID_VBLANK };
++	uint64_t line, frame;
++
++	/* OV32D40 uses fixed factory timing, expressed as a subdev interval.
++	 * Its CSI transport rate cannot convert native FLL counts to output rows.
++	 */
++	if (!strcmp(c->cfg->sensor, "ov32d40")) {
++		struct v4l2_subdev_frame_interval interval = { .pad = 0 };
++
++		if (xioctl(c->sensor_fd, VIDIOC_SUBDEV_G_FRAME_INTERVAL, &interval) < 0)
++			return -1;
++		if ((uint64_t)interval.interval.numerator * (unsigned int)c->cfg->fps !=
++		    interval.interval.denominator) {
++			errno = ERANGE;
++			return -1;
++		}
++		return 0;
++	}
++	if (xioctl(c->sensor_fd, VIDIOC_G_CTRL, &blank) < 0 ||
++	    xioctl(c->sensor_fd, VIDIOC_G_EXT_CTRLS, &controls) < 0 ||
++	    xioctl(c->sensor_fd, VIDIOC_QUERY_EXT_CTRL, &vertical) < 0)
++		return -1;
++	if (blank.value < 0 || rate.value64 <= 0 || vertical.minimum < 0) {
++		errno = ERANGE;
++		return -1;
++	}
++	line = ((uint64_t)c->cfg->in_w + blank.value) * (unsigned int)c->cfg->fps;
++	frame = ((uint64_t)rate.value64 + line - 1) / line;
++	if (frame < c->cfg->in_h + (uint64_t)vertical.minimum ||
++	    frame > c->cfg->in_h + (uint64_t)vertical.maximum) {
++		errno = ERANGE;
++		return -1;
++	}
++	return ctrl_set(c->sensor_fd, V4L2_CID_VBLANK, frame - c->cfg->in_h);
+ }
+ 
+ static int cam_start(struct cam *c)
+@@ -619,6 +785,7 @@
+ 		.memory = V4L2_MEMORY_MMAP,
+ 	};
+ 	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	struct v4l2_rect compose, crop;
+ 
+ 	c->vid_fd = c->sensor_fd = c->vfe_fd = c->vcm_fd = -1;
+ 
+@@ -690,7 +857,9 @@
+ 	ctrl_set(c->sensor_fd, V4L2_CID_HFLIP, cfg->hflip);
+ 	ctrl_set(c->sensor_fd, V4L2_CID_VFLIP, cfg->vflip);
+ 
+-	if (subdev_fmt(c->sensor_fd, 0, cfg->in_w, cfg->in_h, &code) < 0 ||
++	if (sensor_format(c, &code) < 0 ||
++	    sensor_frame_rate(c) < 0 ||
++	    isp_geometry(cfg, &compose, &crop) < 0 ||
+ 	    subdev_fmt(phy_fd, 0, cfg->in_w, cfg->in_h, &code) < 0 ||
+ 	    subdev_fmt(csid_fd, 0, cfg->in_w, cfg->in_h, &code) < 0 ||
+ 	    subdev_fmt(csid_fd, 4, cfg->in_w, cfg->in_h, &code) < 0 ||
+@@ -699,9 +868,18 @@
+ 		goto out;
+ 	}
+ 
+-	sel.r.width = cfg->out_w;
+-	sel.r.height = cfg->out_h;
++	sel.r = compose;
+ 	if (xioctl(c->vfe_fd, VIDIOC_SUBDEV_S_SELECTION, &sel) < 0 ||
++	    sel.r.width != compose.width || sel.r.height != compose.height) {
++		logmsg(c, "ISP compose size: %s", strerror(errno));
++		goto out;
++	}
++	sel.pad = 1;
++	sel.target = V4L2_SEL_TGT_CROP;
++	sel.r = crop;
++	if (xioctl(c->vfe_fd, VIDIOC_SUBDEV_S_SELECTION, &sel) < 0 ||
++	    sel.r.width != crop.width || sel.r.height != crop.height ||
++	    sel.r.left != crop.left || sel.r.top != crop.top ||
+ 	    subdev_fmt(c->vfe_fd, 1, cfg->out_w, cfg->out_h, &yuv) < 0) {
+ 		logmsg(c, "ISP output size: %s", strerror(errno));
+ 		goto out;
+@@ -1276,6 +1454,44 @@
+ 		logmsg(c, "QBUF after frame %u: %s", b.sequence, strerror(errno));
+ }
+ 
++static int loopback_change_format(struct cam *c)
++{
++	struct v4l2_format format = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
++	struct v4l2_streamparm rate = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
++	struct v4l2_requestbuffers release = {
++		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT,
++		.memory = V4L2_MEMORY_MMAP,
++	};
++	struct cam_cfg mode = c->mode;
++	struct v4l2_rect compose, crop;
++
++	if (cam_stop(c) < 0 ||
++	    xioctl(c->loop_fd, VIDIOC_G_FMT, &format) < 0 ||
++	    xioctl(c->loop_fd, VIDIOC_G_PARM, &rate) < 0)
++		return -1;
++	unsigned int fps = rate.parm.output.timeperframe.denominator;
++
++	if (format.fmt.pix.pixelformat != V4L2_PIX_FMT_NV12 ||
++	    rate.parm.output.timeperframe.numerator != 1 ||
++	    select_capture_mode(&mode, format.fmt.pix.width, format.fmt.pix.height, fps) < 0 ||
++	    isp_geometry(&mode, &compose, &crop) < 0) {
++		errno = EINVAL;
++		return -1;
++	}
++	if (xioctl(c->loop_fd, VIDIOC_REQBUFS, &release) < 0 ||
++	    loopback_format(c, mode.out_w, mode.out_h) < 0 ||
++	    loopback_rate(c, fps) < 0)
++		return -1;
++	c->mode = mode;
++	/* Publishing this frame acknowledges the consumer's blocking S_FMT.
++	 * Actual camera DMA still starts only with the existing client-usage event.
++	 */
++	if (loopback_black(c) < 0)
++		return -1;
++	logmsg(c, "output negotiated to %ux%u NV12 at %u fps", mode.out_w, mode.out_h, fps);
++	return 0;
++}
++
+ static void loopback_event(struct cam *c)
+ {
+ 	struct v4l2_event ev;
+@@ -1283,6 +1499,21 @@
+ 	while (!xioctl(c->loop_fd, VIDIOC_DQEVENT, &ev)) {
+ 		const struct v4l2_event_client_usage *u = (const void *)&ev.u;
+ 
++		if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
++			if (loopback_change_format(c) < 0) {
++				logmsg(c, "output reconfiguration: %s", strerror(errno));
++				/* A failed STREAMOFF must keep this process and its capture
++				 * mappings alive. The consumer's negotiation times out;
++				 * it cannot make us tear down uncertain DMA buffers.
++				 */
++				if (!c->streaming) {
++					exit_status = 1;
++					quit = 1;
++				}
++				return;
++			}
++			continue;
++		}
+ 		if (ev.type != V4L2_EVENT_PRI_CLIENT_USAGE)
+ 			continue;
+ 		if (u->count && !c->streaming) {
+@@ -1396,59 +1627,58 @@
+ 		"\"write_attempted\":%s}\n", stage, error, attempted ? "true" : "false");
+ }
+ 
+-/* OV32D40 timing uses OEM HTS1182/FLL2820 at30fps. S5KJN1 timing
+- * uses the verified 560MHz VT clock with HTS4352. Neither is inferred
+- * from CSI throughput. Only matched active modes offer time units. */
++/* S5KJN1 publishes VT timing through standard pixel/blanking controls.
++ * OV32D40 keeps native integration counts and fixed factory frame intervals;
++ * its line period follows the same nominal FLL/interval relation as CamX.
++ */
+ struct exposure_timing { uint64_t line_ns_num, line_ns_den; };
+ 
+ static int exposure_timing(struct cam *c, const struct v4l2_query_ext_ctrl *q,
+ 			  struct exposure_timing *timing)
+ {
+ 	struct v4l2_subdev_format f = { .which = V4L2_SUBDEV_FORMAT_ACTIVE, .pad = 0 };
+-	struct v4l2_query_ext_ctrl vq = { .id = V4L2_CID_VBLANK };
+-	struct v4l2_control vb = { .id = V4L2_CID_VBLANK };
+-	bool rear = !strcmp(c->cfg->sensor, "s5kjn1");
+-	unsigned int width = rear ? 4080 : 3264, height = rear ? 3072 : 2448;
+-	int blank = rear ? 1216 : 372, minimum = rear ? 8 : 4, margin = rear ? 22 : 12;
+-
+-	if ((!rear && strcmp(c->cfg->sensor, "ov32d40")) ||
+-	    c->cfg->in_w != width || c->cfg->in_h != height || c->cfg->fps != 30.0) {
++
++	if (q->type != V4L2_CTRL_TYPE_INTEGER || !q->step) {
+ 		errno = EOPNOTSUPP;
+ 		return -1;
+ 	}
+-	if (xioctl(c->sensor_fd, VIDIOC_SUBDEV_G_FMT, &f) < 0 ||
+-	    xioctl(c->sensor_fd, VIDIOC_QUERY_EXT_CTRL, &vq) < 0 ||
+-	    xioctl(c->sensor_fd, VIDIOC_G_CTRL, &vb) < 0)
+-		return -1;
+-	bool raw10 = f.format.code == MEDIA_BUS_FMT_SBGGR10_1X10 ||
+-		(rear && (f.format.code == MEDIA_BUS_FMT_SGRBG10_1X10 ||
+-			  f.format.code == MEDIA_BUS_FMT_SRGGB10_1X10 ||
+-			  f.format.code == MEDIA_BUS_FMT_SGBRG10_1X10));
+-	if (f.format.width != width || f.format.height != height || !raw10 ||
+-	    vq.type != V4L2_CTRL_TYPE_INTEGER || vq.minimum != blank ||
+-	    vq.default_value != blank || vb.value < blank || vb.value > 65535 - (int)height ||
+-	    q->type != V4L2_CTRL_TYPE_INTEGER || q->minimum != minimum || !q->step || q->step > INT_MAX ||
+-	    q->maximum != (int)height + vb.value - margin || q->maximum > INT_MAX ||
+-	    q->default_value < q->minimum || q->default_value > q->maximum) {
+-		errno = EOPNOTSUPP;
+-		return -1;
+-	}
+-	if (rear) {
+-		struct v4l2_query_ext_ctrl hq = { .id = V4L2_CID_HBLANK };
+-		struct v4l2_control hb = { .id = V4L2_CID_HBLANK };
+-
+-		if (xioctl(c->sensor_fd, VIDIOC_QUERY_EXT_CTRL, &hq) < 0 ||
+-		    xioctl(c->sensor_fd, VIDIOC_G_CTRL, &hb) < 0)
++	if (!strcmp(c->cfg->sensor, "s5kjn1")) {
++		struct v4l2_control blank = { .id = V4L2_CID_HBLANK };
++		struct v4l2_ext_control rate = { .id = V4L2_CID_PIXEL_RATE };
++		struct v4l2_ext_controls controls = {
++			.count = 1, .controls = &rate,
++		};
++
++		if (xioctl(c->sensor_fd, VIDIOC_SUBDEV_G_FMT, &f) < 0 ||
++		    xioctl(c->sensor_fd, VIDIOC_G_CTRL, &blank) < 0 ||
++		    xioctl(c->sensor_fd, VIDIOC_G_EXT_CTRLS, &controls) < 0)
+ 			return -1;
+-		if (hq.type != V4L2_CTRL_TYPE_INTEGER || hq.minimum != 272 ||
+-		    hq.maximum != 272 || hq.default_value != 272 || hb.value != 272) {
++		if (blank.value < 0 || rate.value64 <= 0) {
+ 			errno = EOPNOTSUPP;
+ 			return -1;
+ 		}
+-	}
+-	*timing = rear ? (struct exposure_timing){ UINT64_C(54400), UINT64_C(7) } :
+-		(struct exposure_timing){ UINT64_C(1000000000), UINT64_C(84600) };
+-	return 0;
++		*timing = (struct exposure_timing){
++			((uint64_t)f.format.width + blank.value) * UINT64_C(1000000000),
++			(uint64_t)rate.value64,
++		};
++		return 0;
++	}
++	if (!strcmp(c->cfg->sensor, "ov32d40")) {
++		struct v4l2_subdev_frame_interval interval = { .pad = 0 };
++
++		if (xioctl(c->sensor_fd, VIDIOC_SUBDEV_G_FRAME_INTERVAL, &interval) < 0)
++			return -1;
++		/* The driver fixes native FLL and keeps twelve integration periods
++		 * between maximum exposure and frame end in each factory mode.
++		 */
++		*timing = (struct exposure_timing){
++			(uint64_t)interval.interval.numerator * UINT64_C(1000000000),
++			((uint64_t)q->maximum + 12) * interval.interval.denominator,
++		};
++		return 0;
++	}
++	errno = EOPNOTSUPP;
++	return -1;
+ }
+ 
+ static uint64_t exposure_ns(const struct exposure_timing *timing, uint64_t lines)
+@@ -1881,7 +2111,8 @@
+ 	}
+ 
+ 	for (unsigned int i = 0; i < NUM_CAMS; i++) {
+-		cams[i].cfg = &cam_cfgs[i];
++		cams[i].mode = cam_cfgs[i];
++		cams[i].cfg = &cams[i].mode;
+ 		cams[i].vid_fd = cams[i].sensor_fd = cams[i].vfe_fd =
+ 			cams[i].vcm_fd = -1;
+ 		if (loopback_init(&cams[i]) == 0)
+@@ -1968,5 +2199,5 @@
+ 	control_close();
+ 	logmsg(NULL, "exit");
+ 
+-	return 0;
+-}
++	return exit_status;
++}

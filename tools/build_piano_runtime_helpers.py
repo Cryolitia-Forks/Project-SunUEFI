@@ -55,6 +55,8 @@ CAMERAD_FRAME_PATCH=ROOT/'tools/patches/piano-camerad-frame-integrity.patch'
 CAMERAD_MANUAL_PATCH=ROOT/'tools/patches/piano-camerad-manual-controls.patch'
 CAMERAD_TIMING_PATCH=ROOT/'tools/patches/piano-camerad-front-exposure-time.patch'
 CAMERAD_GROUP_PATCH=ROOT/'tools/patches/piano-camerad-local-video-group.patch'
+CAMERAD_PATCH_SERIES=ROOT/'patches/piano-camera/1/series.json'
+LOOPBACK_PATCH_SERIES=ROOT/'patches/v4l2loopback/0.15.4/series.json'
 
 
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -71,6 +73,23 @@ def repository(path,pin):
 
 def tree_files(folder):return {p.relative_to(folder).as_posix():sha(p)for p in sorted(folder.rglob('*'))if p.is_file()}
 def tree_digest(rows):return hashlib.sha256(json.dumps(rows,sort_keys=True).encode()).hexdigest()
+
+
+def source_patches(series):
+    """Read the shared package patch list used by runtime and Nix builds."""
+    patches=[]
+    for entry in json.loads(series.read_text())['patches']:
+        path=series.parent/entry['file']
+        if sha(path)!=entry['sha256']:
+            raise ValueError('Package patch checksum differs: '+str(path))
+        patches.append(path)
+    return patches
+
+
+def camerad_patches():
+    return [CAMERAD_CCM_PATCH,CAMERAD_AE_PATCH,CAMERAD_FRAME_PATCH,
+            CAMERAD_MANUAL_PATCH,CAMERAD_TIMING_PATCH,CAMERAD_GROUP_PATCH,
+            *source_patches(CAMERAD_PATCH_SERIES)]
 
 
 def entry_source(name):
@@ -103,13 +122,13 @@ def derive_touch_source(public, output):
 
 
 def derive_camerad_source(public, output):
-    """Apply CCM, AE/AF, frame integrity, manual controls and mode timing."""
+    """Apply the shared ISP, controls and application-format support."""
     relative,pin,_=PUBLIC_SOURCES['piano-camerad'];original=Path(public)/relative
     if sha(original)!=pin:raise ValueError('Public camera source changed')
     folder=Path(output)/'piano-camera-source';target=folder/relative
     target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(original,target)
     patches=[]
-    for patch in (CAMERAD_CCM_PATCH,CAMERAD_AE_PATCH,CAMERAD_FRAME_PATCH,CAMERAD_MANUAL_PATCH,CAMERAD_TIMING_PATCH,CAMERAD_GROUP_PATCH):
+    for patch in camerad_patches():
         # This generated directory is inside the parent Git checkout. Git can
         # silently skip a git-format patch whose paths lie outside that prefix.
         # Apply the standard patch to this standalone source copy instead.
@@ -326,7 +345,8 @@ def build(args):
     inputs[str(TOUCH_CAPTURE_PATCH)]=sha(TOUCH_CAPTURE_PATCH)
     inputs[str(TOUCH_PEN_PATCH)]=sha(TOUCH_PEN_PATCH)
     inputs[str(TOUCH_EPOCH_PATCH)]=sha(TOUCH_EPOCH_PATCH)
-    for patch in (CAMERAD_CCM_PATCH,CAMERAD_AE_PATCH,CAMERAD_FRAME_PATCH,CAMERAD_MANUAL_PATCH,CAMERAD_TIMING_PATCH):
+    for patch in [CAMERAD_PATCH_SERIES,LOOPBACK_PATCH_SERIES,
+                  *camerad_patches(),*source_patches(LOOPBACK_PATCH_SERIES)]:
         inputs[str(patch)]=sha(patch)
     for name,pin in TOOL_PINS.items():
         p=tools/name
@@ -397,6 +417,10 @@ def build(args):
     tracked=capture(['git','ls-files','-z'],args.v4l2_source.resolve()).split('\0')
     for name in filter(None,tracked):
         original=args.v4l2_source.resolve()/name;target=module_source/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(original,target);inputs[str(original)]=sha(original)
+    for patch in source_patches(LOOPBACK_PATCH_SERIES):
+        subprocess.run(['patch','--batch','--forward','--fuzz=0',
+                        '--no-backup-if-mismatch','-p1','-i',str(patch)],
+                       cwd=module_source,check=True)
     run(['make','-C',args.kernel_build.resolve(),'M='+str(module_source),'ARCH=arm64','LLVM=1','LLVM_IAS=1','LOCALVERSION=','-j4','modules'],env,log)
     module=module_source/'v4l2loopback.ko';run([tools/'llvm-strip','--strip-debug',module],env,log);info=modinfo(module)
     if info.get('name')!='v4l2loopback'or info.get('vermagic','').split()[0]!=args.kernel_release:raise ValueError('External module does not match requested exact kernel')

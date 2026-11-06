@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "patches": [
+    {
+      "file": "0001-capture-format-negotiation.patch",
+      "sha256": "992ed075e4428aa63a5af81e96fc58d3156a36d42d3e07f0ba340c818f0ad45a"
+    }
+  ]
+}

@@ -1,66 +1,69 @@
-# 相机手动控制
+# 相机格式与控件
 
-相机服务提供曝光、增益、白平衡和后摄对焦的手动控制接口。正常 runtime 构建会同时生成相机服务和 `piano-camera-ctl` 客户端，rootfs 构建会将它们一起安装；手动控制复用已有相机服务的硬件连接和帧循环。
+相机服务通过 CAMSS 硬件 ISP 输出 NV12，应用看到前摄、后摄两个正常的 V4L2 摄像头。服务只在应用开流时启动传感器和 ISP，关闭流后停止 DMA。曝光、白平衡和后摄对焦由同一服务的帧循环控制。
 
-`tools/patches/piano-camerad-manual-controls.patch` 应用在固定上游 `debian-piano a75f8c5d5fa099d65c171ac839c2e3bb6c63ec45` 的 CCM、启动/稳定 3A、帧完整性三补丁之后。准确前置 camera 源码 SHA256 是 `0a96e7d4aa2dd23bd1f49cbdfae37578327f47d3a9118464cbdfd924bf9f6f1d`。它只修改已有 camerad，不改变帧格式和缓冲路径。CLI 的正式源码在 `linux/userspace/piano-camera-ctl.c`，后续正常构建安装到相机 BSP 的 `/usr/bin/piano-camera-ctl`；不要把源码文件作为 rootfs overlay 安装。
+## 分辨率和帧率
 
-现有 camerad 在自己的 poll 循环处理 `/run/piano-camerad/control.sock`，socket 为 `root:video 0660`，目录为 `root:video 0750`。没有额外服务或相机硬件 owner。先用正常相机应用开流；未开流时所有命令返回 `ENODEV`，不会暗中启动相机。
+默认输出为 1920×1440、30 fps。应用通过标准 `VIDIOC_S_FMT` 和 `VIDIOC_S_PARM` 选择尺寸和帧率，不需要修改服务配置。
+
+| 相机 | 传感器模式 | 标称帧率 |
+| --- | --- | --- |
+| 后摄 S5KJN1 | 4080×3060、4080×2296 | 30 fps |
+| 后摄 S5KJN1 | 3840×2160 | 60 fps |
+| 后摄 S5KJN1 | 8160×6120 | 10 fps |
+| 前摄 OV32D40 | 3264×2448、3264×1836 | 30 fps |
+| 前摄 OV32D40 | 6528×4896 | 10 fps |
+
+这些是驱动和服务实现的模式，不代表已经完成实机画面、帧率与稳定性验证。后摄新模式使用同机原厂静态 ODM 寄存器表；来源记录在内核补丁中。19.2 MHz 输入时钟、857.6 MHz CSI 链路由共享设备树配置，旧 24 MHz 传感器表仍保留给使用该时钟的设备树。
+
+输出可以小于传感器模式。宽度按 16 像素、高度按 2 像素对齐；ISP 先等比缩放，再居中裁切不同宽高比，不拉伸画面。极小输出受 ISP 最大 16 倍缩小限制，会进一步裁切视野。60 fps 只公布给后摄 3840×2160 以内的输出，前后摄全尺寸模式均只公布 10 fps。前摄三张寄存器表与同机原厂静态配置逐条一致；驱动通过现代 pad-level 帧间隔接口报告固定模式的原厂标称 10/30 fps，服务开流前读回并核对。该数值不是硬件帧计数器的测量结果。
+
+原始 v4l2loopback 在生产者设置格式后只向读取者公布该格式。共享的
+[v4l2loopback 补丁](../../../patches/v4l2loopback/0.15.4/series.json) 与
+[camerad 补丁](../../../patches/piano-camera/1/series.json) 增加同一设备上的生产者协商：
+
+1. 首帧写入前，服务依次设置各模式的最大尺寸、帧间隔，并订阅 `SOURCE_CHANGE`，登记该生产者支持的组合。
+2. 应用使用标准尺寸、帧间隔枚举和 `S_FMT` / `S_PARM`。驱动通过 `SOURCE_CHANGE` 通知服务，并等待生产者确认。
+3. 服务停止 CAMSS、释放旧输出缓冲，接受尺寸和帧率，再写入完整黑帧。驱动在尺寸、帧间隔和整帧都匹配后才完成应用的协商。
+4. 原有应用使用计数事件仍负责实际开流和停流；原始传感器返回的尺寸贯穿 PHY、CSID 和 ISP 配置。
+
+这是本项目对 loopback 的扩展，不是原始驱动已有的动态尺寸功能。未订阅的生产者保持原有行为。活跃采集或仍被映射的缓冲会阻止切换；停止失败时保留采集缓冲和进程，等待应用超时，不释放可能仍用于 DMA 的映射。没有增加虚拟摄像头、格式选择按钮或额外服务。
+
+## 手动控件
+
+正常 runtime 构建同时安装相机服务和 `piano-camera-ctl`。客户端复用服务已有的硬件连接；未开流时返回 `ENODEV`，不会暗中启动相机。
 
 ```sh
 piano-camera-ctl caps rear
 piano-camera-ctl get rear
 piano-camera-ctl set rear ae manual
-piano-camera-ctl set rear exposure INTEGER
-piano-camera-ctl set rear analog-gain INTEGER
-piano-camera-ctl set rear digital-gain INTEGER
-piano-camera-ctl set rear awb manual
-piano-camera-ctl set rear red-balance INTEGER
-piano-camera-ctl set rear blue-balance INTEGER
-piano-camera-ctl set rear af manual
-piano-camera-ctl set rear focus INTEGER
+piano-camera-ctl set rear exposure-time-ns 500000
+piano-camera-ctl set rear ae auto
 ```
 
-将 `INTEGER` 换成 `caps` 允许的数值。`rear` 可换为 `front`，但前摄没有 VCM，不支持 `af` 和 `focus`。对应的 `set … ae|awb|af auto` 恢复自动控制。
+`rear` 可换为 `front`，但前摄没有对焦马达。`caps` 返回当前模式的最小值、最大值、步长、默认值和标志；应用换模式后应重新查询。
 
-| 控件 | 呈现单位 | 硬件接口 |
+| 控件 | 单位 | 硬件接口 |
 | --- | --- | --- |
-| exposure | sensor lines | 传感器 `V4L2_CID_EXPOSURE` |
-| exposure-time-ns | 纳秒，仅已匹配的前后摄模式 | 换算为同一传感器曝光控件，按行数取整 |
-| analog-gain | 驱动原生整数 | 传感器 `V4L2_CID_ANALOGUE_GAIN` |
+| exposure | 原生积分计数，后摄以行为单位 | `V4L2_CID_EXPOSURE` |
+| exposure-time-ns | 纳秒，按合法曝光行数取整 | 同一传感器曝光控件 |
+| analog-gain | 驱动原生整数 | `V4L2_CID_ANALOGUE_GAIN` |
 | digital-gain | Q10，1024 为 1× | TFE `V4L2_CID_DIGITAL_GAIN` |
-| red-balance / blue-balance | Q10，1024 为 1× | TFE 红/蓝平衡控件 |
+| red-balance / blue-balance | Q10 | TFE 红、蓝平衡控件 |
 | focus | 驱动原生 DAC 值 | 后摄 `V4L2_CID_FOCUS_ABSOLUTE` |
 
-`caps` 用 `VIDIOC_QUERY_EXT_CTRL` 返回 min/max/step/default/flags，数值写入前再次查询；不硬编码某个模式的曝光上限。`get` 用 `VIDIOC_G_CTRL` 返回驱动控制状态，不宣称读取物理寄存器。没有校准依据的 ISO、Kelvin、物理焦距或对焦距离换算。
+AE、AWB、AF 分别保存自动或手动状态。数值写入要求先把对应域切为 `manual`，避免自动算法覆盖；恢复 `auto` 从当前控件状态继续。每次只写一个控件并读回，失败保留 errno；多个控件不构成硬件原子事务。回复丢失时先执行 `get`，再决定是否重试。
 
-前摄 OV32D40 的 3264×2448 模式可用 `exposure-time-ns` 按时间设置曝光。打开前摄预览后执行：
+后摄曝光行时间由驱动的 VT `PIXEL_RATE`、图像宽度和 `HBLANK` 计算，帧长通过 `VBLANK` 设置。原厂 19.2 MHz 表的 VT 时钟为 `19200000 × 131 × 4 / (3 × 6)` Hz，与 CSI 传输率分别处理；不把 857.6 MHz 链路吞吐当成积分时钟。
 
-```sh
-piano-camera-ctl caps front
-piano-camera-ctl set front ae manual
-piano-camera-ctl set front exposure-time-ns 500000
-piano-camera-ctl get front
-piano-camera-ctl set front ae auto
-```
+前摄保留原生积分计数。原厂程序不按分辨率缩放曝光计数，直接写入 `0x3500..0x3502`；6528×4896 的原厂 FLL 为 2551，不能把它当成 4896 行图像做减法。驱动删除失实的 HBLANK/VBLANK 控件，模式表固定 FLL，并将曝光上限设为 FLL−12，避免旧 blanking 值覆盖新模式时序。CSI 推导的 `PIXEL_RATE` 仅沿用作现有 CAMSS 时钟票据，不用于积分时间换算。
 
-`500000` 纳秒约为 1/2000 秒；当前模式会取最近合法的 42 行，约 496454 纳秒。回复同时给出请求时间、接受的行数和读回时间。每次换算均核对传感器活动格式、VBLANK 和曝光范围；模式不匹配时明确拒绝。`caps/get` 的时间控件包含行时间分数和当前值，曝光上限继续跟随驱动当前范围。
+前摄时间接口使用原厂标称帧间隔除以原生 FLL，与 CamX 的积分时间关系一致。3264×2448、3264×1836 的计数周期为 `1e9 / 84600` 纳秒；500000 纳秒取最近合法的 42 个周期，约 496454 纳秒。全尺寸周期为 `1e9 / 25510` 纳秒，相同请求取 13 个周期，约 509604 纳秒。它们保持原厂时间单位，不声称解决了像素阵列时钟或并行读出比例。没有校准依据的 ISO、Kelvin、物理焦距或对焦距离换算不对外提供。
 
-前摄该模式的行时间为 `1e9 / 84600` 纳秒，来自原厂 HTS1182、FLL2820、30 fps 参数及 CamX 的积分时钟算法，最短四行与 Android 的 47281 纳秒相符。CSI 输出像素率不用于曝光换算。时间补丁接在手动控制补丁之后，由正常 producer 统一应用。
+控制 socket 为 `/run/piano-camerad/control.sock`，权限 `root:video 0660`。它没有额外守护进程，也不替代应用的 V4L2 格式协商。
 
-后摄 S5KJN1 的 4080×3072 模式也提供时间控件。将上述命令的 `front` 换为 `rear`，请求 500000 纳秒会选中 64 行，约 497371 纳秒。这个模式的积分时钟为 560 MHz、行长为 4352，行时间是 `54400 / 7` 纳秒；同一颗传感器的[厂商固定源码](https://github.com/MotorolaMobilityLLC/kernel-mtk/blob/4cbe43fe20dc19b9c5218553468efb3b868567c5/drivers/misc/mediatek/imgsensor/src/common/v1_1/mot_devonn_s5kjn1_mipi_raw/s5kjn1mipiraw_Sensor.c#L68)明确区分积分时钟和 MIPI 像素率，其[VT PLL 配置](https://github.com/MotorolaMobilityLLC/kernel-mtk/blob/4cbe43fe20dc19b9c5218553468efb3b868567c5/drivers/misc/mediatek/imgsensor/src/common/v1_1/mot_devonn_s5kjn1_mipi_raw/settings/s5kjn1_4080x3072_30fps.h#L255)与当前 Linux 配置一致。后摄运行时另外核对 HBLANK 为 272、VBLANK 默认 1216，以及曝光上限保留 22 行的间隔。其他分辨率或时序不匹配时拒绝换算；不使用原厂不同模式的行时间，也不从标称 30 fps 反推该模式的积分时钟。
+## 闪光灯
 
-2026-10-09 已在同一默认相机服务中完成后摄读回：请求 500000 纳秒，接受 64 行，`get` 返回 497371 纳秒；随后恢复自动曝光并停止开流。记录在本地 `内部记录目录
+PMIC 闪光灯使用标准 LED flash 和 V4L2 flash 控件，后摄通过 `flash-leds` 描述关联。现有电流、超时和外部触发源设置不会自动产生与传感器曝光同步的脉冲。同步拍照需要把闪光请求与传感器曝光、CAMSS 帧时序连接；使用外部触发时还需确认实际 strobe 线路。原厂软件触发也受帧请求调度约束，用户态定时点灯不能代替这条链路。
 
-AE、AWB、AF 各自拥有自动/手动状态；数值写入必须先把对应域切为 manual，自动算法不会覆盖该域。模式切换先读回该域的现有控件，恢复 auto 从这个状态继续。手动曝光仍保留帧统计供后摄 AF 判断稳定性。每个数值请求只写一个白名单控件，随后读回；失败保留 errno，读回不一致同时给出 requested/value 并返回错误。多个传感器/TFE 控件不构成硬件原子事务；回复丢失或读回失败后应先 `get`，再决定是否重试。
-
-两个正常 producer 顺序应用这份补丁、继续编译同一 camerad，并另编 CLI；stage 的完整文件集合包含客户端。CLI 的 main 使用 argc/argv，不复用 camerad 的 void-main wrapper。二进制不存入 Git，无需新增 systemd unit。
-
-2026-10-09 已使用完成的 Debian rootfs 作为 ARM64 sysroot 编译完整 runtime。相机服务与客户端随后随 `7.2.9-piano-gnome-gc8bf8df4d2ca` 部署；客户端 SHA256 为 `a2039e1415fea9a7d2640fc5a330faa3d848e0fdc780f99c6586232975de1097`。正常构建与 stage 都包含这两个静态 AArch64 程序。
-
-实机后摄开流期间，`caps/get` 成功查询控件；AE 切为 manual 后，将当前曝光写回并读到相同值，再恢复 auto，所有步骤均成功。该模式的曝光范围为 8–4266 行、模拟增益 1–64、数字增益 1024–16383（Q10）、对焦 DAC 0–1023。前摄查询也成功，并正确报告没有对焦马达。这些范围对应当前模式，应用应重新查询，不能写成所有模式的常量。测试只丢弃帧数据，没有保存图像或改变永久参数。
-
-在 `7.2.9-piano-gnome-g5902d3af6f62` 前摄开流中，`set front exposure-time-ns 500000` 成功，读回 42 行、496454 纳秒；随后恢复 AE auto 成功，关闭流后隐私灯控制值为 0。结果保存在 `内部记录目录
-
-Snapshot 首次远程打开时可能停在概览中。该版本等待窗口获得焦点后才开始相机发现；退出 GNOME 概览后，前摄可进入正常预览。不要仅凭窗口的加载动画判断相机服务没有工作。
-
-这套接口还不是原厂相机专业模式。原厂 Android 的小米扩展公布后摄 ISO 50–6400，QTI 视频表另有 3840×2160/60 fps；前摄标准输出包含 1920×1080/30 fps。当前 Linux 相机输出仍固定为 1920×1440/30 fps，不能因原厂能力表存在这些条目就直接宣布支持 4K60。ISO 换算需要传感器增益标定，其他传感器模式需要各自的积分行时钟，Kelvin 色温需要白平衡和色彩标定。测光模式、裁切变焦和闪光灯同步仍需适配；隐私指示灯的驱动与 PWM 联动结果见[实现说明](camera-privacy-led.md)。
+隐私指示灯的驱动与 PWM 联动见[实现说明](camera-privacy-led.md)。它与拍照闪光灯用途不同。
