@@ -203,6 +203,10 @@ static void modes(void)
 	struct cam_cfg mode = cam_cfgs[0];
 	struct v4l2_rect compose, crop;
 
+	assert(select_capture_mode(&mode, 4080, 2296, 30) == 0);
+	assert(mode.in_w == 4080 && mode.in_h == 2296 && mode.fps == 30);
+	assert(select_capture_mode(&mode, 1920, 1080, 30) == 0);
+	assert(mode.in_w == 4080 && mode.in_h == 3060 && mode.fps == 30);
 	assert(select_capture_mode(&mode, 3840, 2160, 60) == 0);
 	assert(mode.in_w == 3840 && mode.in_h == 2160 && mode.fps == 60);
 	assert(select_capture_mode(&mode, 4080, 3060, 60) < 0);
@@ -215,6 +219,10 @@ static void modes(void)
 	assert(select_capture_mode(&mode, 3840, 2160, 30) < 0);
 	assert(select_capture_mode(&mode, 1920, 1080, 60) < 0);
 	assert(select_capture_mode(&mode, 3264, 2448, 30) == 0);
+	assert(select_capture_mode(&mode, 3264, 1836, 30) == 0);
+	assert(mode.in_w == 3264 && mode.in_h == 1836 && mode.fps == 30);
+	assert(select_capture_mode(&mode, 1920, 1080, 30) == 0);
+	assert(mode.in_w == 3264 && mode.in_h == 2448 && mode.fps == 30);
 	assert(select_capture_mode(&mode, 6528, 4896, 30) < 0);
 	assert(select_capture_mode(&mode, 6528, 4896, 10) == 0);
 	assert(mode.in_w == 6528 && mode.in_h == 4896 && mode.fps == 10);
