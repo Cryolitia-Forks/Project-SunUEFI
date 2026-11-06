@@ -41,6 +41,8 @@ def source_inputs():
     return {
         'config_sha256': digest(ROOT / 'config/fingerprint.json'),
         'client_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix.c'),
+        'events_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix-events.c'),
+        'events_header_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix-events.h'),
         'storage_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix-storage.c'),
         'storage_header_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix-storage.h'),
         'builder_sha256': digest(Path(__file__)),
@@ -107,6 +109,7 @@ def build(output, flags, emulator=None):
             'UsefulBuf.c', 'qcbor_encode.c', 'qcbor_decode.c',
             'qcbor_err_to_str.c', 'ieee754.c')],
         ROOT / 'linux/userspace/fingerprint/piano-goodix-storage.c',
+        ROOT / 'linux/userspace/fingerprint/piano-goodix-events.c',
         ROOT / 'linux/userspace/fingerprint/piano-goodix.c',
     ]
     objects = []

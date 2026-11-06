@@ -28,6 +28,7 @@
 #include <qcbor/qcbor_decode.h>
 #include <qcbor/qcbor_encode.h>
 #include <qcbor/qcbor_spiffy_decode.h>
+#include "piano-goodix-events.h"
 #include "piano-goodix-storage.h"
 
 #define FIRMWARE "/usr/lib/firmware/gfpia.elf"
@@ -249,8 +250,9 @@ static int open_client(struct client *client)
 	return client->shared_size >= SHARED_SIZE ? 0 : -EMSGSIZE;
 }
 
-static int application_command(struct client *client, uint32_t route,
-			       uint32_t command, size_t size)
+static int application_command_status(struct client *client, uint32_t route,
+				      uint32_t command, size_t size,
+				      int32_t *application_status)
 {
 	struct goodix_request request = {0};
 	int32_t response[16] = {0};
@@ -286,16 +288,32 @@ static int application_command(struct client *client, uint32_t route,
 		return result;
 	if (args[5].b.size < 2 * sizeof(int32_t))
 		return -EMSGSIZE;
-	if (response[0] || response[1]) {
+	if (response[1]) {
 		fprintf(stderr, "Goodix command %u: application=%d buffer=%d\n",
 			command, response[0], response[1]);
 		return -EREMOTEIO;
 	}
+	*application_status = response[0];
 	return 0;
 }
 
-static int sensor_command(struct client *client, uint32_t command, size_t size)
+static int application_command(struct client *client, uint32_t route,
+			       uint32_t command, size_t size)
 {
+	int32_t status = 0;
+	int result = application_command_status(client, route, command, size, &status);
+
+	if (!result && status) {
+		fprintf(stderr, "Goodix command %u: application=%d\n", command, status);
+		result = -EREMOTEIO;
+	}
+	return result;
+}
+
+static int sensor_command_status(void *context, uint32_t command, size_t size,
+				 int32_t *application_status)
+{
+	struct client *client = context;
 	time_t now = time(NULL);
 	struct tm local;
 
@@ -306,7 +324,19 @@ static int sensor_command(struct client *client, uint32_t command, size_t size)
 	localtime_r(&now, &local);
 	/* Descriptive factory metadata, unrelated to authentication tokens. */
 	strftime((char *)client->shared + 0x4c, 0x20, "%Y-%m-%d %H:%M:%S", &local);
-	return application_command(client, 1, command, size);
+	return application_command_status(client, 1, command, size, application_status);
+}
+
+static int sensor_command(struct client *client, uint32_t command, size_t size)
+{
+	int32_t status = 0;
+	int result = sensor_command_status(client, command, size, &status);
+
+	if (!result && status) {
+		fprintf(stderr, "Goodix command %u: application=%d\n", command, status);
+		result = -EREMOTEIO;
+	}
+	return result;
 }
 
 static void clear_sensitive(void *buffer, size_t size)
@@ -745,22 +775,31 @@ static int watch_events(struct client *client, unsigned int seconds)
 {
 	struct timespec start, now;
 	struct pollfd event = { .fd = client->controller, .events = POLLIN };
-	uint8_t *payload = client->shared;
-	int result;
-
-	if (client->shared_size < 0xd134)
-		return -EMSGSIZE;
-	memset(payload, 0, client->shared_size);
-	result = sensor_command(client, 1009, 0x70); /* idle / finger detection */
+	struct goodix_events events = {
+		.command = sensor_command_status, .context = client,
+		.buffer = client->shared, .buffer_size = client->shared_size,
+	};
+	struct sigaction action = { .sa_handler = stop_watching }, previous_int, previous_term;
+	int result = goodix_events_start(&events);
+	int handlers = 0, stopped;
 	if (result)
 		return result;
-	signal(SIGINT, stop_watching);
-	signal(SIGTERM, stop_watching);
+	interrupted = 0;
+	sigemptyset(&action.sa_mask);
+	if (sigaction(SIGINT, &action, &previous_int)) {
+		result = -errno;
+		goto cancel;
+	}
+	handlers = 1;
+	if (sigaction(SIGTERM, &action, &previous_term)) {
+		result = -errno;
+		goto cancel;
+	}
+	handlers = 2;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	fprintf(stderr, "Sensor ready; watching interrupts for %u seconds.\n", seconds);
 	while (!interrupted) {
-		uint32_t counter, mask, enable = 1, one = 1, maximum = 512;
-		uint32_t flags = 0x02000000;
+		uint32_t counter, enable = 1;
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		int64_t remaining = (int64_t)seconds * 1000 -
 			((now.tv_sec - start.tv_sec) * 1000 +
@@ -770,31 +809,60 @@ static int watch_events(struct client *client, unsigned int seconds)
 		int ready = poll(&event, 1, remaining > 500 ? 500 : remaining);
 		if (ready < 0 && errno == EINTR)
 			continue;
-		if (ready < 0)
-			return -errno;
+		if (ready < 0) {
+			result = -errno;
+			break;
+		}
 		if (!ready)
 			continue;
-		if (!(event.revents & POLLIN))
-			return -EIO;
-		if (read(client->controller, &counter, sizeof(counter)) != sizeof(counter))
-			return -EIO;
-		memset(payload, 0, client->shared_size);
-		memcpy(payload + 0x98, &one, sizeof(one));
-		memcpy(payload + 0xa8, &maximum, sizeof(maximum));
-		memcpy(payload + 0x2c5, &flags, sizeof(flags));
-		/* Query/acknowledge the sensor before allowing its next IRQ.
-		 * No image or template data is saved or printed.
+		if (!(event.revents & POLLIN) ||
+		    read(client->controller, &counter, sizeof(counter)) != sizeof(counter)) {
+			result = -EIO;
+			break;
+		}
+		/* Drain the TA handshake before re-enabling its IRQ. The deadline
+		 * and cancellation are checked between calls, including phases 4/5.
+		 * Never print image buffers, template identities or authentication tokens.
 		 */
-		result = sensor_command(client, 1016, 0xd134);
+		do {
+			struct goodix_sensor_event sample;
+
+			result = goodix_events_read(&events, &sample);
+			if (result < 0) {
+				if (result == -EOPNOTSUPP)
+					fputs("Sensor requested image processing; the event watch cannot authenticate.\n",
+					      stderr);
+				break;
+			}
+			printf("{\"irq_count\":%u,\"sensor_events\":%u,\"operation\":%u,"
+			       "\"phase\":%u,\"application_status\":%d}\n",
+			       counter, sample.mask, sample.operation, sample.phase,
+			       sample.application_status);
+			fflush(stdout);
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			remaining = (int64_t)seconds * 1000 -
+				((now.tv_sec - start.tv_sec) * 1000 +
+				 (now.tv_nsec - start.tv_nsec) / 1000000);
+		} while (result == 1 && remaining > 0 && !interrupted);
 		if (result)
-			return result;
-		memcpy(&mask, payload + 0x6c, sizeof(mask));
-		printf("{\"irq_count\":%u,\"sensor_events\":%u}\n", counter, mask);
-		fflush(stdout);
-		if (write(client->controller, &enable, sizeof(enable)) != sizeof(enable))
-			return -EIO;
+			break;
+		if (write(client->controller, &enable, sizeof(enable)) != sizeof(enable)) {
+			result = -EIO;
+			break;
+		}
 	}
-	return 0;
+	/* A handshake interrupted by the deadline is a normal end to the watch.
+	 * The explicit cancel below must succeed in either case.
+	 */
+	if (result == 1)
+		result = 0;
+cancel:
+	stopped = goodix_events_cancel(&events);
+	if (handlers == 2)
+		sigaction(SIGTERM, &previous_term, NULL);
+	if (handlers)
+		sigaction(SIGINT, &previous_int, NULL);
+	return result ? result : stopped;
 }
 
 int main(int argc, char **argv)
@@ -819,7 +887,7 @@ int main(int argc, char **argv)
 		     "       piano-fingerprint-ctl storage-probe --state-dir <empty-directory> <group>\n"
 		     "Query the real Goodix sensor through UIO and QTEE.\n"
 		     "initialize also reads the sensor's geometry and calibration.\n"
-		     "watch reports sensor event flags for 1-120 seconds (default 30).\n"
+		     "watch reports sensor event flags for 1-120 seconds (default 30), then cancels.\n"
 		     "list queries TA templates without file services.\n"
 		     "storage-probe serves restricted FS/GPFS in an explicit empty Linux directory,\n"
 		     "then initializes and selects a group; it does not enroll, remove or authenticate.\n"

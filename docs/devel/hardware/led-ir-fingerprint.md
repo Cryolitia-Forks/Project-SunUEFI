@@ -82,7 +82,7 @@ Linux 已完成供电、复位和关闭。普通桌面应用的认证仍需 libf
 Goodix 客户端的设备信息命令为路由 1、命令 1000，128 字节请求、
 64 字节响应，另带传感器共享缓冲区。Linux 能加载并正常关闭安全程序。
 QSEECOMPAT 的 lookup 返回 `architecture=2`，命令应使用 64 位地址，
-不能按外层固件的 ELF32 封装选择地址宽度。修正后传输层返回成功，
+地址宽度按服务返回值选择；当前签名固件本身也是 ELF64。修正后传输层返回成功，
 最初响应中的缓冲区状态为 `-1`，原因是小缓冲区来自 4 GiB 以上的伙伴
 分配器。该安全程序接受的共享区域必须在 4 GiB 以下；使用默认 CMA
 池中的 4 KiB 缓冲区后，传输、应用和缓冲区状态均返回成功，
@@ -114,6 +114,13 @@ QSEECOMPAT 的 lookup 返回 `architecture=2`，命令应使用 64 位地址，
 [`固件清单`](../../../vendor/firmware/hyperos4-fingerprint/manifest.json)，
 不会安装原厂可执行库。
 
+本机原厂 HAL 的构建目标为 `xiaomi_P81_GF3656ZSCB_qsee5_sm8750_64bit_aidl_2025`。
+`gf_hal_show_version`（`0x1ed64`）给出包版本 `V1.0.6.0.0` 和软件版本
+`1.0.6.0.2.0`。当前国际版库与固件清单中的国内版库整文件摘要不同，但按 ELF
+导出符号提取的三份模型逐字节相同，因此不需要替换 Linux 模型。两份完整签名
+`gfpia` 的可加载代码和数据仅有三处构建时间字符串不同，另有对应签名元数据差异。
+这些静态比对不代替实际录入或认证测试。
+
 协议顺序如下，所有命令都通过公开 QTEE 接口进入原厂签名程序：
 
 | 命令 | 功能 |
@@ -127,9 +134,26 @@ QSEECOMPAT 的 lookup 返回 `architecture=2`，命令应使用 64 位地址，
 | 1002 | 关闭传感器，随后关闭安全程序并归还供电 |
 
 `sudo piano-fingerprint-ctl watch 30` 在限定时间内监听 UIO 中断，最多 120 秒。
-收到中断后先通过安全程序确认，再重新启用 IRQ；输出只有事件标志和中断计数，
-不保存或输出图像、模板和认证令牌。启动与待机过程已收到中断并完成确认；
-这不等于手指检测、匹配或解锁已经完成。Ctrl+C 可正常结束并释放硬件。
+事件接口位于 [`piano-goodix-events.c`](../../../linux/userspace/fingerprint/piano-goodix-events.c)，
+由现有客户端调用；它将传输错误与安全程序返回的采集状态分开，保留事件包推进
+阶段 4、5，完成后才重新启用 IRQ。输出包括事件标志、中断计数、操作、阶段和
+应用状态，不保存或输出图像、模板 ID 和认证令牌。尚未接入的采集、导航阶段 2、8
+返回不支持，并发送取消命令，不将未处理事件当成匹配结果。超时、Ctrl+C 和错误
+退出都先执行真实取消，再关闭安全程序及 UIO。这里的时限在每条同步 QTEE 命令
+返回后检查，不能中断一条尚未返回的安全调用。
+
+上述字段来自原厂 Milan 函数表 `gf_hal_milan_function_customize`（`0x3f778`）：
+取消函数 `0x40188` 发送命令 1009、`0x70` 字节；IRQ 函数 `0x41390` 发送
+1016、`0xd134` 字节，设置 `+0x98=1`、`+0xa8=512`、`+0x2c5=0x02000000`。
+响应的 `+0x6c` 是事件位图、`+0x70` 是操作、`+0x98` 是处理阶段。
+`0x415a4–0x41610` 在阶段 4、5 保留原包再次调用 1016。阶段 2 的普通路径同样
+保留原包继续 1016；特定录入模式将包扩至 `0x10e9e0` 字节。阶段 8 在处理导航
+通知后清零 `+0x2f4` 起 `0x5a20` 字节，再继续交换。当前客户端尚未实现这两条
+状态分支；静态调用链未发现必须运行 Android HAL 内专有匹配算法的环节。
+`+0x2c5` 是输出 HAT 中的大端 `authenticator_type`，数值表示指纹类型 2，
+不是可替代录入授权的令牌。`libgf_ca.so:gf_ca_invoke_command`（`0x4170`）将
+64 字节响应中的第一个字作为应用状态返回，第二个字单独表示共享缓冲区错误；
+不能把所有非零应用状态都当成 QTEE 传输失败。
 
 `sudo piano-fingerprint-ctl list 1000` 创建 Linux 目录
 `/var/lib/piano-goodix/1000`，将分组 ID 和路径交给命令 1014，再通过 1015
@@ -174,6 +198,34 @@ sharing key，已有绑定可用时直接使用，避免重置其他客户端的
 原有[旧 GPFS 协议记录](../../../linux/bsp/patches/qtee/README.md)保留厂商接口说明；
 它不是 Linux 文件系统隔离或 RPMB 写入授权的依据。
 
-完整命令协议和 libfprint 后端仍在适配，因此不能在 Linux 中录入或验证指纹。
+录入和认证的入口布局已由原厂 `libgf_hal.so` 静态确认，均使用路由 1：
+
+| 操作 | 函数与命令 | 共享包内容 |
+| --- | --- | --- |
+| 生成录入挑战 | `gf_hal_common_pre_enroll`，`0x2115c`，1006／`0x78` 字节 | 挑战位于 `+0x70` |
+| 开始录入 | `gf_hal_common_enroll`，`0x2161c`，1007／`0xbc` 字节 | 分组 `+0x6c`，真实的 69 字节 HAT 位于 `+0x76` |
+| 结束录入 | `gf_hal_common_post_enroll`，`0x219b4`，1008／`0x6c` 字节 | 结束该次录入流程 |
+| 开始认证 | `gf_hal_common_authenticate`，`0x21a18`，1010／`0x80` 字节 | 分组 `+0x6c`，操作 ID `+0x70`，`+0x78=-1` |
+| 保存模板 | `gf_hal_save`，`0x20a74`，1012／`0x78` 字节 | 分组、模板 ID 位于 `+0x6c`、`+0x70` |
+| 删除模板 | `gf_hal_common_remove`，`0x21f34`，1013／`0xcc` 字节 | 分组、模板 ID 位于 `+0x6c`、`+0x70`；返回数量在 `+0xc8` |
+
+成功结果由 Milan 结果分发函数 `0x42308` 判断：应用状态为零后，再区分操作。
+操作 1、2 的认证结果携带分组、模板 ID（`+0x80`、`+0x84`）及 HAT
+（`+0x2ac`，69 字节）；`0x42774` 将这些字段交给认证成功回调。
+`gf_hal_common_authenticate_success`（`0x248b4`）使用同样布局。录入操作 0
+则读取剩余次数 `+0x88`，归零后必须经 1012 保存，不能仅凭手指中断或
+进度归零报告录入成功。以上入口没有作为诊断客户端命令开放，也未在本轮执行。
+
+匹配重试状态 1064（`GF_ERROR_MATCH_FAIL_AND_RETRY`）需要将 `+0x98` 的
+64 位值设为 2 并继续 1016。认证成功还需完成原厂的策略更新 1109，以及
+`GF_CMD_AUTHENTICATE_FINISH`（1086、`0x148` 字节）；后者不是可省略的日志命令。
+
+标准 libfprint 后端仍缺少三项实质功能：独立 Linux 凭据的合法 Gatekeeper/HAT
+签发；完整的 1016 采集、重试、结果和取消状态机；可恢复的独立模板存储、备份与
+删除事务。现有受限 FS/GPFS 只覆盖初始化，既没有按 TA 身份隔离回调，也未提供
+完整模板事务。Android 的[标准指纹会话接口](https://android.googlesource.com/platform/hardware/interfaces/+/b91c536488ae4de7782b0b8f1f6a9bba642692ad/biometrics/fingerprint/aidl/android/hardware/biometrics/fingerprint/ISession.aidl)
+要求录入使用真实 HAT；认证入口接收操作 ID，并在成功后返回 HAT，不要求先传入
+新的录入 HAT。因此不能将 Keymaster 绑定或 IRQ 检测描述成已实现认证。当前仍使用
+密码登录，不向 GNOME 注册无法完成录入和验证的指纹设备，也不读取或复制 Android 模板。
 
 随后bde3普通重启发现，虽然modules-load文件已安装，旧modprobe黑名单仍使systemd把LPG记为deny-listed。已仅移除 `leds_qcom_lpg` 这一条，并让完整root stager与通用BSP使用同一份tracked modprobe配置。重新启动标准modules-load后插入LPG并出现三个接口，随后一次完整正常重启也已确认三个接口自动出现。当前记录在 `bde3-rgb-startup.txt` 与 `bde3-rgb-policy-fixed.txt`，不能用之前手动modprobe结果替代启动策略验证。
