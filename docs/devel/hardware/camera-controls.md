@@ -20,7 +20,7 @@
 
 原始 v4l2loopback 在生产者设置格式后只向读取者公布该格式。共享的
 [v4l2loopback 补丁](../../../patches/v4l2loopback/0.15.4/series.json) 与
-[camerad 补丁](../../../patches/piano-camera/1/series.json) 增加同一设备上的生产者协商：
+[相机源码](../../../linux/userspace/camera/piano-camerad.c) 增加同一设备上的生产者协商：
 
 1. 首帧写入前，服务依次设置各模式的最大尺寸、帧间隔，并订阅 `SOURCE_CHANGE`，登记该生产者支持的组合。
 2. 应用使用标准尺寸、帧间隔枚举和 `S_FMT` / `S_PARM`。驱动通过 `SOURCE_CHANGE` 通知服务，并等待生产者确认。

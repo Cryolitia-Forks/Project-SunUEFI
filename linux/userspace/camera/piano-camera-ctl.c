@@ -11,6 +11,16 @@
 
 #define CONTROL_PATH "/run/piano-camerad/control.sock"
 
+static void usage(FILE *stream, const char *program)
+{
+	fprintf(stream, "Usage: %s caps|get rear|front\n"
+			"       %s set rear|front ae|awb|af auto|manual\n"
+			"       %s set rear|front exposure|analog-gain|digital-gain|red-balance|blue-balance|focus INTEGER\n"
+			"       %s set rear|front exposure-time-ns NANOSECONDS\n"
+			"The camera must already be streaming. Exposure time is quantized to sensor lines; caps reports the active mode and live ranges. Other values use driver-native units.\n",
+			program, program, program, program);
+}
+
 int main(int argc, char **argv)
 {
 	struct sockaddr_un sa = { .sun_family = AF_UNIX, .sun_path = CONTROL_PATH };
@@ -19,13 +29,13 @@ int main(int argc, char **argv)
 	int fd;
 	ssize_t n;
 
+	if (argc == 2 && !strcmp(argv[1], "--help")) {
+		usage(stdout, argv[0]);
+		return 0;
+	}
+
 	if (argc != 3 && argc != 5) {
-		fprintf(stderr, "Usage: %s caps|get rear|front\n"
-			"       %s set rear|front ae|awb|af auto|manual\n"
-			"       %s set rear|front exposure|analog-gain|digital-gain|red-balance|blue-balance|focus INTEGER\n"
-			"       %s set rear|front exposure-time-ns NANOSECONDS\n"
-			"The camera must already be streaming. Exposure time is quantized to sensor lines; caps reports the active mode and live ranges. Other values use driver-native units.\n",
-			argv[0], argv[0], argv[0], argv[0]);
+		usage(stderr, argv[0]);
 		return 2;
 	}
 	for (int i = 1; i < argc; i++) {

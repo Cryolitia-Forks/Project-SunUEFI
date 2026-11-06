@@ -16,7 +16,7 @@ import build_piano_runtime_helpers as runtime
 class PianoRuntimeBuilderTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'Native C compiler unavailable')
     def test_camerad_readiness_notification_without_camera_access(self):
-        source=ROOT/'upstream/debian-piano-current'/runtime.PUBLIC_SOURCES['piano-camerad'][0]
+        source=ROOT/'linux/userspace/camera/piano-camerad.c'
         if not source.exists():self.skipTest('Pinned camera source not fetched')
         with tempfile.TemporaryDirectory(prefix='camera-notify-')as directory:
             folder=Path(directory);harness=folder/'notify.c';binary=folder/'notify'
@@ -35,7 +35,7 @@ class PianoRuntimeBuilderTests(unittest.TestCase):
         if not(ROOT/'build/distros/piano-runtime-build/usr/lib/aarch64-linux-gnu/libc.a').exists():self.skipTest('Verified native ARM64 sysroot not prepared')
         with tempfile.TemporaryDirectory(prefix='runtime-build-test-',dir=ROOT/'build')as directory:
             output=Path(directory)/'bundle';args=runtime.parser().parse_args(['--output',str(output)])
-            manifest=runtime.build(args);self.assertEqual(len(manifest['runtime_files']),5);self.assertFalse(manifest['hardware_verified'])
+            manifest=runtime.build(args);self.assertTrue(runtime.CAMERA_RUNTIME_PATHS <= manifest['runtime_files'].keys());self.assertFalse(manifest['hardware_verified'])
             self.assertEqual(manifest['kernel']['release'],runtime.DEFAULT_RELEASE)
             for name in runtime.PUBLIC_SOURCES:self.assertTrue(runtime.verify_elf(output/name)['static_no_pt_interp'])
             module=output/'v4l2loopback/v4l2loopback.ko';self.assertEqual(runtime.modinfo(module)['vermagic'].split()[0],runtime.DEFAULT_RELEASE)
@@ -48,7 +48,7 @@ class PianoRuntimeBuilderTests(unittest.TestCase):
         if not(build/'Module.symvers').exists():self.skipTest('Full candidate kernel not built')
         with self.assertRaisesRegex(ValueError,'release differs'):runtime.kernel_identity(build,source,runtime.UAPI_COMMIT,'7.2.6-wrong')
         identity=runtime.kernel_identity(build,source,runtime.UAPI_COMMIT,runtime.DEFAULT_RELEASE);self.assertEqual(identity['commit'],runtime.UAPI_COMMIT)
-        for name in ('piano-camerad','piano-pd-locator'):
+        for name in ('piano-pd-locator',):
             text=runtime.entry_source(name);self.assertIn('PianoOriginalMain(void)',text)
             self.assertLess(text.index('"--help"'),text.index('return PianoOriginalMain()'))
         with self.assertRaises(ValueError):runtime.entry_source('untrusted-program')

@@ -5,13 +5,10 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / 'tools'))
-import build_piano_runtime_helpers as runtime
 
 
 class PianoCameraTests(unittest.TestCase):
@@ -20,13 +17,10 @@ class PianoCameraTests(unittest.TestCase):
         compiler = shlex.split(os.environ.get('CC', 'cc'))
         if not compiler or not shutil.which(compiler[0]):
             raise unittest.SkipTest('Native C compiler unavailable')
-        public = ROOT / 'upstream/debian-piano-current'
-        if not (public / 'camera/piano-camerad.c').exists():
-            raise unittest.SkipTest('Pinned camera source not fetched')
         temporary = tempfile.TemporaryDirectory(prefix='piano-camera-')
         cls.addClassCleanup(temporary.cleanup)
         work = Path(temporary.name)
-        source, _ = runtime.derive_camerad_source(public, work)
+        source = ROOT / 'linux/userspace/camera/piano-camerad.c'
         cls.binary = work / 'camera-check'
         subprocess.run([
             *compiler, '-O2', f'-DPIANO_CAMERAD_SOURCE="{source}"',

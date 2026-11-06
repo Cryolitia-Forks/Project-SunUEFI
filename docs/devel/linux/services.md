@@ -10,9 +10,7 @@
 | 本地 DMA 状态读取与启动准备 helper | [`linux/userspace/piano-ram-hardware-prepare`](../../../linux/userspace/piano-ram-hardware-prepare) | 由上述适配工具安装到 `/usr/lib/piano/`；也用于磁盘根系统，名字保留自早期 RAM 启动 |
 | 触屏帧解析与输入上报 | [`upstream/debian-piano-current/initramfs/touch-view/piano-touch-view.c`](../../../upstream/debian-piano-current/initramfs/touch-view/piano-touch-view.c) | 编译为 `/usr/bin/piano-touch-view`，由 `piano-touch.service` 启动 |
 | 触屏程序的本地观测补丁 | [`tools/patches/piano-touch-view-observability.patch`](../../../tools/patches/piano-touch-view-observability.patch) | `build_piano_runtime_helpers.py` 派生源码，`build_release_helpers.py` 编译 |
-| 相机服务与图像桥接程序 | [`linux/bsp/optional/camera/`](../../../linux/bsp/optional/camera/) 与 [`upstream/debian-piano-current/camera/piano-camerad.c`](../../../upstream/debian-piano-current/camera/piano-camerad.c) | 可选配置包安装 unit；helper 构建工具编译 `/usr/lib/piano/piano-camerad` |
-| 相机 CCM 控件回写修复 | [`tools/patches/piano-camerad-writable-ccm.patch`](../../../tools/patches/piano-camerad-writable-ccm.patch) | `build_piano_runtime_helpers.py` 派生可写数组；`build_release_helpers.py` 使用同一来源，避免 `S_EXT_CTRLS` 向只读常量回写而报 `Bad address` |
-| 相机自动曝光稳定性 | [`tools/patches/piano-camerad-stable-ae.patch`](../../../tools/patches/piano-camerad-stable-ae.patch) | 同一 `derive_camerad_source()` 顺序应用 CCM 和 AE 补丁，两条 helper 构建入口使用相同源码 |
+| 相机服务与图像桥接程序 | [`linux/userspace/camera/`](../../../linux/userspace/camera/) 与 [`linux/bsp/optional/camera/`](../../../linux/bsp/optional/camera/) | 共享 Makefile 编译程序；配置包安装 unit、udev 和 WirePlumber 规则 |
 | 音频 UCM、模块加载参数、udev 配置 | [`linux/bsp/common/`](../../../linux/bsp/common/) | 按目录布局安装；文件清单在 `linux/bsp/manifest.json` |
 | Linux 调试入口与引导脚本 | [`linux/userspace/`](../../../linux/userspace/) | 包含 `piano-debug-bootstrap`、debug/serial unit、磁盘与 RAM 引导脚本 |
 | GNOME 电源键与保护套合盖 | [`linux/desktops/gnome/power-overlay/`](../../../linux/desktops/gnome/power-overlay/) | 复用 `piano-power-button.service`，完整 stager 和 GNOME 组装安装同一份源码；当前只控制背光，锁屏/睡眠限制见[说明](../hardware/power-button.md) |
@@ -28,7 +26,7 @@
 
 相机硬件当前只交给 `piano-camerad` 管理；它配置 CSID→TFE PIX、缩放和 NV12，并提供曝光、白平衡、对焦控制。[WirePlumber 配置](../../../linux/bsp/optional/camera/etc/wireplumber/wireplumber.conf.d/50-piano-camera.conf) 因此禁用 `monitor.libcamera` 和直连 CAMSS 节点，应用使用 loopback。标准 [libcamera v0.7.1 simple pipeline](https://gitlab.freedesktop.org/camera/libcamera/-/blob/v0.7.1/src/libcamera/pipeline/simple/simple.cpp) 有通用 CAMSS/software ISP 支持，但尚未接入这里的 TFE 硬件 ISP 路径；不要同时开启两个管理程序争用传感器。若以后改用 libcamera，需要先完成 media 路径、硬件控件及图像调校的接入。
 
-相机3A指自动曝光、白平衡和对焦，当前这部分必要算法由 `piano-camerad` 使用内核 sensor/ISP 控件实现。前摄自然光日志中，高亮像素占比在3%..8%间变化；旧 AE 跨过4%时会突然降约19%曝光量，又因平均亮度不足而提高增益。稳定性补丁改为连续高亮响应、每相机统计滤波、约5%亮度误差死区和单次6%变化上限，保留既有曝光/增益分配、白平衡与对焦。用户确认现场是自然光、没有开室内灯，因此没有强制新增50Hz防闪烁参数。
+相机3A指自动曝光、白平衡和对焦，当前这部分必要算法由 `piano-camerad` 使用内核 sensor/ISP 控件实现。前摄自然光日志中，高亮像素占比在3%..8%间变化；旧 AE 跨过4%时会突然降约19%曝光量，又因平均亮度不足而提高增益。当前实现使用连续高亮响应、每相机统计滤波、约5%亮度误差死区和单次6%变化上限，保留既有曝光/增益分配、白平衡与对焦。用户确认现场是自然光、没有开室内灯，因此没有强制新增50Hz防闪烁参数。
 
 修正后的 ARM64 camerad 已部署。本机前摄的一次900帧采集中，启动3秒后的810帧全画面 YAVG 为76.54..77.76，曝光和两项增益保持2808/15872/6958；程序自身的局部亮度统计为93..95，采样范围不同，不能直接比较这两组亮度的绝对值。采集只保留统计，没有保存相机视频。这确认了该场景下控制循环稳定，尚未测量光照突变和完整模式切换，也不代表完整原厂3A调校。原始统计在本地 `内部记录目录
 

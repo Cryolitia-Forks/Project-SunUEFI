@@ -1,9 +1,0 @@
-{
-  "schema_version": 1,
-  "patches": [
-    {
-      "file": "0001-output-format-negotiation.patch",
-      "sha256": "e1342c7843990f70e33447d465e53b4106b0b09b76bd1e9dadce3c91e86a7adf"
-    }
-  ]
-}
