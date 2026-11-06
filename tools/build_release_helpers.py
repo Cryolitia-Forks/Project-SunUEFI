@@ -129,6 +129,9 @@ def build(kernel, source, kernel_build, output, cc, sysroot, macros, loop):
         target = module_source / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(loop / name, target)
+    for patch in runtime.source_patches(runtime.LOOPBACK_PATCH_SERIES):
+        run(['patch', '--batch', '--forward', '--fuzz=0', '-p1',
+             '--directory', module_source, '--input', patch])
     run(['make', '-C', kernel_build, 'M=' + str(module_source), 'ARCH=arm64', 'LLVM=1', 'LOCALVERSION=', 'modules'])
     module = module_source / 'v4l2loopback.ko'
     item = modinfo(module)

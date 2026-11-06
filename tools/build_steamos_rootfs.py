@@ -344,7 +344,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / 'build/distros/steamos-piano')
     parser.add_argument('--bootstrap-sysroot', type=Path, default=Path('/'),
-                        help='Native ARM64 Debian build environment containing busybox-static')
+                        help='Prepared ARM64 Debian development sysroot with busybox-static and static libyuv/libjpeg')
     parser.add_argument('--kernel-build', type=Path, default=ROOT / 'build/kernels/release',
                         help='Build directory matching artifacts/kernels/release')
     parser.add_argument('--resume', action='store_true')

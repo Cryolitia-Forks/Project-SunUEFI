@@ -137,7 +137,8 @@ def build(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / 'build/distros/nyarch-gnome-piano')
-    parser.add_argument('--bootstrap-sysroot', type=Path, default=Path('/'))
+    parser.add_argument('--bootstrap-sysroot', type=Path, default=Path('/'),
+                        help='Prepared ARM64 Debian development sysroot with busybox-static and static libyuv/libjpeg')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()

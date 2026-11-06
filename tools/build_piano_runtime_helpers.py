@@ -29,7 +29,9 @@ PUBLIC_SOURCES={
  'piano-touch-view':('initramfs/touch-view/piano-touch-view.c','eb1bac5a7bfac3200248ebe39e8d9564bed3d7848b11655ded5d065dc0ef6e12','usr/bin/piano-touch-view'),
  'piano-pd-locator':('initramfs/pd-locator/piano-pd-locator.c','8de9d2840a896b4bd6c90bd4b124479d2f142e9e85420f2022894bb32fc8dde8','usr/sbin/piano-pd-locator')}
 CAMERA_RUNTIME_PATHS={'usr/lib/piano/piano-camerad','usr/bin/piano-camera-ctl',
- 'usr/share/licenses/piano-camera/LICENSE-MIT'}
+ 'usr/share/licenses/piano-camera/LICENSE-MIT',
+ 'usr/share/licenses/piano-quad/LICENSE-MIT',
+ 'usr/share/licenses/demosaic/LICENSE-MIT'}
 PEN_SOURCE_FILES=('Makefile','piano-pen-frame.c','piano-pen-frame.h',
  'piano-pen-core.cpp','piano-pen-core.h','piano-pen-decoder.cpp',
  'piano-pen-decoder.hpp','piano-pen-offline.cpp','piano-pen-owner.c',
@@ -116,8 +118,41 @@ def camera_inputs():
         for name in sorted(files):
             path = Path(folder) / name
             rows[str(path)] = sha(path)
+    series = ROOT / 'patches/demosaic/0.3.0/series.json'
+    for path in [series, *source_patches(series)]:
+        rows[str(path)] = sha(path)
     rows[str(Path(__file__).resolve())] = sha(Path(__file__).resolve())
     return rows
+
+
+def prepare_camera_quad(source, work, env):
+    """Materialize the fixed, patched dependency in this build directory."""
+    import urllib.request
+
+    series = ROOT / 'patches/demosaic/0.3.0/series.json'
+    item = json.loads(series.read_text())['source']
+    name = item['pname'] + '-' + item['version']
+    archive = ROOT / 'build/source-cache/camera' / (name + '.crate')
+    if not archive.exists():
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        temporary = archive.with_suffix('.download')
+        url = 'https://static.crates.io/crates/' + item['pname'] + '/' + name + '.crate'
+        with urllib.request.urlopen(url, timeout=30) as response, temporary.open('wb') as output:
+            shutil.copyfileobj(response, output)
+        if sha(temporary) != item['sha256']:
+            raise ValueError('Camera dependency download checksum differs: ' + name)
+        temporary.replace(archive)
+    if sha(archive) != item['sha256']:
+        raise ValueError('Camera dependency archive checksum differs: ' + str(archive))
+    run(['tar', '-xf', archive, '-C', work], env, work / 'build.log')
+    dependency = work / name
+    for patch in source_patches(series):
+        run(['patch', '--batch', '--forward', '--fuzz=0', '-p1',
+             '--directory', dependency, '--input', patch], env, work / 'build.log')
+    vendor = source / 'quad/vendor'
+    vendor.mkdir()
+    (vendor / item['pname']).symlink_to(dependency.resolve(), target_is_directory=True)
+    return dependency
 
 
 def build_camera(output, cc_flags, cxx_flags, uapi, sysroot=None, env=None,
@@ -130,6 +165,7 @@ def build_camera(output, cc_flags, cxx_flags, uapi, sysroot=None, env=None,
     inputs = camera_inputs()
     shutil.copytree(ROOT / 'linux/userspace/camera', source,
                     ignore=shutil.ignore_patterns('vendor', 'target'))
+    dependency = prepare_camera_quad(source, work, build_env)
     if sysroot:
         build_env['PKG_CONFIG_SYSROOT_DIR'] = str(sysroot)
         build_env['PKG_CONFIG_LIBDIR'] = os.pathsep.join(str(Path(sysroot) / path) for path in (
@@ -142,7 +178,11 @@ def build_camera(output, cc_flags, cxx_flags, uapi, sysroot=None, env=None,
                'CFLAGS=' + shlex.join(flags),
                'CPPFLAGS=' + shlex.join(['-isystem', str(Path(uapi) / 'include')]),
                'LDFLAGS=' + shlex.join(['-static', *linker_flags]),
-               'PKG_CONFIG=pkg-config --static']
+               'PKG_CONFIG=pkg-config --static',
+               # Debian's libyuv-dev supplies no .pc file. The compiler
+               # already selects the target sysroot and its standard paths.
+               'YUV_CFLAGS=', 'YUV_LIBS=-lyuv']
+    command.append('CARGO_TARGET=aarch64-unknown-linux-gnu')
     run(command, build_env, work / 'build.log')
     files = {}
     for name, destination in (('piano-camerad', 'usr/lib/piano/piano-camerad'),
@@ -159,6 +199,13 @@ def build_camera(output, cc_flags, cxx_flags, uapi, sysroot=None, env=None,
     files['usr/share/licenses/piano-camera/LICENSE-MIT'] = {
         'file': str(license.relative_to(output)), 'mode': 0o644,
         'bytes': license.stat().st_size, 'sha256': sha(license)}
+    for license, destination in (
+        (source / 'quad/LICENSE-MIT', 'usr/share/licenses/piano-quad/LICENSE-MIT'),
+        (dependency / 'LICENSE-MIT', 'usr/share/licenses/demosaic/LICENSE-MIT'),
+    ):
+        files[destination] = {
+            'file': str(license.relative_to(output)), 'mode': 0o644,
+            'bytes': license.stat().st_size, 'sha256': sha(license)}
     for path, digest in inputs.items():
         if sha(Path(path)) != digest:
             raise ValueError('Camera build input changed: ' + path)
@@ -453,7 +500,8 @@ def build(args):
 def parser():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--public-source',type=Path,default=ROOT/'upstream/debian-piano-current');p.add_argument('--uapi',type=Path,default=ROOT/'build/piano-runtime/uapi')
-    p.add_argument('--sysroot',type=Path,default=ROOT/'build/distros/piano-runtime-build');p.add_argument('--macros',type=Path,default=ROOT/'build/piano-runtime/topology/macros');p.add_argument('--alsa-tools',type=Path,default=ROOT/'build/piano-runtime/topology/host-tools')
+    p.add_argument('--sysroot',type=Path,default=ROOT/'build/distros/piano-runtime-build',
+                   help='Prepared ARM64 GNU development sysroot with static libyuv/libjpeg');p.add_argument('--macros',type=Path,default=ROOT/'build/piano-runtime/topology/macros');p.add_argument('--alsa-tools',type=Path,default=ROOT/'build/piano-runtime/topology/host-tools')
     p.add_argument('--v4l2-source',type=Path,default=ROOT/'build/piano-runtime/v4l2loopback');p.add_argument('--kernel-source',type=Path,default=ROOT/'build/kernel-worktrees/piano-full-integration');p.add_argument('--kernel-commit',default=UAPI_COMMIT)
     p.add_argument('--kernel-build',type=Path,default=ROOT/'build/kernels/full-integration');p.add_argument('--kernel-release',default=DEFAULT_RELEASE);p.add_argument('--stage-rootfs',type=Path)
     return p

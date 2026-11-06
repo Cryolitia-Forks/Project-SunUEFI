@@ -36,11 +36,17 @@
 #include <sys/un.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <linux/media.h>
 #include <linux/media-bus-format.h>
 #include <linux/v4l2-subdev.h>
 #include <linux/videodev2.h>
+#include <libyuv/scale.h>
+
+#include "quad-worker.h"
+#include "loopback-output.h"
+#include "photo/timing.h"
 
 /* v4l2loopback private event: capture side streaming started/stopped */
 #define V4L2_EVENT_PRI_CLIENT_USAGE (V4L2_EVENT_PRIVATE_START + 0x08E00000 + 1)
@@ -133,16 +139,29 @@ struct buf {
 
 #define AF_HIST		64	/* sharpness samples kept per scan */
 
+#define PHOTO_FLASH_CHANNELS 2
+struct camera_flash {
+	int fd, mode, source, timeout, intensity;
+	struct v4l2_query_ext_ctrl timeout_range;
+	bool saved, configured;
+};
+
 struct cam {
 	struct cam_cfg mode;
 	const struct cam_cfg *cfg;
 	int loop_fd;
+	struct loopback_output loop_output;
 	bool streaming;
 	int vid_fd, sensor_fd, vfe_fd, vcm_fd;
 	struct buf bufs[NUM_BUFS];
 	unsigned int bpl, sizeimage, nbufs;
 	size_t uv_offset, frame_span;
 	uint8_t *stage;		/* repacked frame when bpl != width */
+	/* Only the full rear Quad CFA mode uses RDI and CPU conversion. */
+	bool quad_raw;
+	struct quad_worker *quad_worker;
+	struct timeval quad_timestamp;
+	uint32_t quad_timestamp_flags;
 	unsigned long frames;
 	/* sensor control ranges */
 	int exp_min, exp_max, ag_min, ag_max;
@@ -166,6 +185,14 @@ struct cam {
 	int af_fine[3];			/* fine pass positions */
 	int af_hist_pos[AF_HIST];	/* samples of the current scan */
 	double af_hist_val[AF_HIST];
+	struct piano_photo_capture photo;
+	struct camera_flash flash[PHOTO_FLASH_CHANNELS];
+	unsigned int flash_count, loop_users;
+	unsigned int photo_recover_frames;
+	bool photo_owned_stream, saved_ae_manual, saved_wb_manual, saved_af_manual;
+	uint32_t colorspace, ycbcr_enc, quantization;
+	struct piano_photo_timing photo_timing;
+	bool frame_sync_subscribed;
 };
 
 static struct cam cams[NUM_CAMS];
@@ -175,6 +202,19 @@ static double srgb_lin[256];
 static int saturation = DEF_SATURATION * SAT_UNITY / 100;
 static int contrast = DEF_CONTRAST;
 static int af_settle_frames;
+
+static const struct piano_photo_ops camera_photo_ops;
+static int camera_photo_request(struct cam *c, int client_fd);
+static void camera_photo_frame(struct cam *c, const struct v4l2_buffer *buffer,
+			       const uint8_t *y, const uint8_t *uv, bool complete);
+
+static uint64_t monotonic_ns(void)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+}
 
 static void logmsg(const struct cam *c, const char *fmt, ...)
 {
@@ -357,6 +397,32 @@ static int route(struct topo *tp, const struct media_v2_entity *src,
 	return setup_link(tp, src->id, src_pad, sink->id, sink_pad, true);
 }
 
+/* PIX and RDI are different CSID pads. Disable the old output before changing
+ * paths; route() alone only resolves conflicts on the requested pad.
+ * Keep other CSIDs, including an active front camera, untouched.
+ */
+static int csid_output(struct topo *tp, const struct media_v2_entity *csid,
+		       unsigned int pad)
+{
+	for (unsigned int i = 0; i < tp->t.num_links; i++) {
+		const struct media_v2_link *link = &tp->links[i];
+		const struct media_v2_pad *src, *sink;
+
+		if ((link->flags & MEDIA_LNK_FL_LINK_TYPE) != MEDIA_LNK_FL_DATA_LINK ||
+		    !(link->flags & MEDIA_LNK_FL_ENABLED) ||
+		    (link->flags & MEDIA_LNK_FL_IMMUTABLE))
+			continue;
+		src = topo_pad(tp, link->source_id);
+		sink = topo_pad(tp, link->sink_id);
+		if (!src || !sink || src->entity_id != csid->id || src->index == pad)
+			continue;
+		if (setup_link(tp, src->entity_id, src->index, sink->entity_id,
+			       sink->index, false) < 0)
+			return -1;
+	}
+	return 0;
+}
+
 static int find_media(void)
 {
 	char path[32];
@@ -504,19 +570,28 @@ static size_t frame_size(const struct cam_cfg *cfg)
 	return (size_t)cfg->out_w * cfg->out_h * 3 / 2;
 }
 
-static int loopback_write_frame(struct cam *c, const uint8_t *frame)
+static int loopback_write_frame(struct cam *c, const uint8_t *frame,
+				const struct timeval *timestamp, uint32_t flags)
 {
-	size_t size = frame_size(c->cfg);
-	ssize_t written = write(c->loop_fd, frame, size);
+	int result = loopback_output_publish(&c->loop_output, frame,
+					     frame_size(c->cfg), timestamp, flags);
 
-	if (written < 0)
-		return -1;
-	if ((size_t)written != size) {
-		logmsg(c, "short loopback frame: wrote %zd of %zu bytes", written, size);
-		errno = EIO;
+	if (result < 0) {
+		errno = -result;
 		return -1;
 	}
 	return 0;
+}
+
+static void loopback_close(struct cam *c)
+{
+	int result = loopback_output_clear(&c->loop_output);
+
+	if (result < 0)
+		logmsg(c, "loopback queue cleanup: %s", strerror(-result));
+	if (c->loop_fd >= 0)
+		close(c->loop_fd);
+	c->loop_fd = -1;
 }
 
 static int loopback_black(struct cam *c)
@@ -530,7 +605,15 @@ static int loopback_black(struct cam *c)
 		return -1;
 	memset(black, 0, luma);
 	memset(black + luma, 128, size - luma);
-	ret = loopback_write_frame(c, black);
+	struct timespec now;
+	struct timeval timestamp;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+		free(black);
+		return -1;
+	}
+	timestamp = (struct timeval){ .tv_sec = now.tv_sec, .tv_usec = now.tv_nsec / 1000 };
+	ret = loopback_write_frame(c, black, &timestamp, V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC);
 	free(black);
 
 	return ret;
@@ -634,6 +717,12 @@ static int loopback_init(struct cam *c)
 	    xioctl(c->loop_fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0)
 		return -1;
 
+	int result = loopback_output_setup(&c->loop_output, c->loop_fd, frame_size(cfg));
+	if (result < 0) {
+		errno = -result;
+		return -1;
+	}
+
 	/* one black frame: the device turns into a capture device */
 	if (loopback_black(c) < 0)
 		return -1;
@@ -648,11 +737,14 @@ static void apply_exposure(struct cam *c)
 {
 	ctrl_set(c->sensor_fd, V4L2_CID_EXPOSURE, c->exposure);
 	ctrl_set(c->sensor_fd, V4L2_CID_ANALOGUE_GAIN, c->again);
-	ctrl_set(c->vfe_fd, V4L2_CID_DIGITAL_GAIN, c->dgain);
+	if (!c->quad_raw)
+		ctrl_set(c->vfe_fd, V4L2_CID_DIGITAL_GAIN, c->dgain);
 }
 
 static void apply_wb(struct cam *c)
 {
+	if (c->quad_raw)
+		return;
 	ctrl_set(c->vfe_fd, V4L2_CID_RED_BALANCE,
 		 (int)lround(c->rgain * WB_UNITY));
 	ctrl_set(c->vfe_fd, V4L2_CID_BLUE_BALANCE,
@@ -667,6 +759,7 @@ static int cam_stop(struct cam *c)
 	};
 	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
+	piano_photo_abort(&c->photo, EPIPE, true);
 	if (c->vid_fd >= 0) {
 		if (xioctl(c->vid_fd, VIDIOC_STREAMOFF, &type) < 0 && c->streaming) {
 			logmsg(c, "STREAMOFF: %s; retaining capture buffers", strerror(errno));
@@ -694,6 +787,91 @@ static int cam_stop(struct cam *c)
 	if (c->streaming)
 		logmsg(c, "stopped after %lu frames", c->frames);
 	c->streaming = false;
+	c->photo_owned_stream = false;
+	c->frame_sync_subscribed = false;
+	piano_photo_timing_reset(&c->photo_timing);
+	/* The worker owns a copied frame only. Release capture DMA first, then
+	 * wait for its current CPU conversion before freeing the workspace.
+	 */
+	int result = quad_worker_stop(c->quad_worker);
+	if (result < 0) {
+		errno = -result;
+		return -1;
+	}
+	c->quad_worker = NULL;
+	c->quad_raw = false;
+	return 0;
+}
+
+/* Full JN1 readout is Quad CFA: the four colours describe 2x2 same-colour
+ * blocks. Use the order accepted after the sensor's actual flip controls;
+ * the ordinary 2x2 Bayer demosaic of the TFE PIX line is unsuitable here.
+ */
+static int quad_format(uint32_t code, uint32_t *fourcc, uint32_t *cfa)
+{
+	switch (code) {
+	case MEDIA_BUS_FMT_SRGGB10_1X10:
+		*fourcc = V4L2_PIX_FMT_SRGGB10P;
+		*cfa = PIANO_QUAD_RGGB;
+		return 0;
+	case MEDIA_BUS_FMT_SBGGR10_1X10:
+		*fourcc = V4L2_PIX_FMT_SBGGR10P;
+		*cfa = PIANO_QUAD_BGGR;
+		return 0;
+	case MEDIA_BUS_FMT_SGRBG10_1X10:
+		*fourcc = V4L2_PIX_FMT_SGRBG10P;
+		*cfa = PIANO_QUAD_GRBG;
+		return 0;
+	case MEDIA_BUS_FMT_SGBRG10_1X10:
+		*fourcc = V4L2_PIX_FMT_SGBRG10P;
+		*cfa = PIANO_QUAD_GBRG;
+		return 0;
+	default:
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+}
+
+static int capture_layout(struct cam *c)
+{
+	const struct cam_cfg *cfg = c->cfg;
+
+	if (c->quad_raw) {
+		size_t row_bytes = (size_t)cfg->in_w * 5 / 4;
+
+		/* G_FMT supplies the real DMA stride; RAW10 row padding is not
+		 * part of the image and must not be guessed from the sensor width.
+		 */
+		c->uv_offset = 0;
+		c->frame_span = (size_t)(cfg->in_h - 1) * c->bpl + row_bytes;
+		if (c->bpl < row_bytes || c->sizeimage < c->frame_span) {
+			errno = EINVAL;
+			logmsg(c, "invalid RAW10 layout: stride %u sizeimage %u span %zu",
+			       c->bpl, c->sizeimage, c->frame_span);
+			return -1;
+		}
+		if (cfg->out_w != cfg->in_w || cfg->out_h != cfg->in_h) {
+			c->stage = malloc(frame_size(cfg));
+			if (!c->stage)
+				return -1;
+		}
+		return 0;
+	}
+
+	c->uv_offset = (size_t)c->bpl * cfg->out_h;
+	c->frame_span = c->uv_offset + (size_t)(cfg->out_h / 2 - 1) * c->bpl +
+			cfg->out_w;
+	if (c->bpl < cfg->out_w || c->sizeimage < c->frame_span) {
+		errno = EINVAL;
+		logmsg(c, "invalid NV12 layout: stride %u sizeimage %u span %zu", c->bpl,
+		       c->sizeimage, c->frame_span);
+		return -1;
+	}
+	if (c->bpl != cfg->out_w) {
+		c->stage = malloc(frame_size(cfg));
+		if (!c->stage)
+			return -1;
+	}
 	return 0;
 }
 
@@ -780,6 +958,10 @@ static int cam_start(struct cam *c)
 	struct topo tp;
 	int mfd, phy_fd = -1, csid_fd = -1, ret = -1;
 	uint32_t code = 0, yuv = MEDIA_BUS_FMT_YUYV8_1_5X8;
+	uint32_t raw_fourcc = 0, quad_cfa = 0;
+	bool raw = !strcmp(cfg->sensor, "s5kjn1") && cfg->in_w == 8160 &&
+		   cfg->in_h == 6120;
+	unsigned int csid_pad = raw ? 1 : 4;
 	struct v4l2_subdev_selection sel = {
 		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
 		.pad = 0,
@@ -794,6 +976,11 @@ static int cam_start(struct cam *c)
 	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	struct v4l2_rect compose, crop;
 
+	if (c->quad_worker) {
+		errno = EBUSY;
+		return -1;
+	}
+	c->quad_raw = raw;
 	c->vid_fd = c->sensor_fd = c->vfe_fd = c->vcm_fd = -1;
 
 	mfd = find_media();
@@ -810,8 +997,8 @@ static int cam_start(struct cam *c)
 	sen = topo_entity(&tp, cfg->sensor);
 	phy = topo_entity(&tp, cfg->phy);
 	csid = topo_entity(&tp, cfg->csid);
-	vfe = topo_entity(&tp, cfg->vfe);
-	vid = topo_entity(&tp, cfg->video);
+	vfe = topo_entity(&tp, raw ? "msm_vfe0_rdi0" : cfg->vfe);
+	vid = topo_entity(&tp, raw ? "msm_vfe0_video0" : cfg->video);
 	if (!sen || !phy || !csid || !vfe || !vid) {
 		logmsg(c, "media entities missing");
 		goto out;
@@ -855,7 +1042,9 @@ static int cam_start(struct cam *c)
 		}
 	}
 
-	if (route(&tp, phy, 1, csid, 0) < 0 || route(&tp, csid, 4, vfe, 0) < 0) {
+	if (route(&tp, phy, 1, csid, 0) < 0 ||
+	    csid_output(&tp, csid, csid_pad) < 0 ||
+	    route(&tp, csid, csid_pad, vfe, 0) < 0) {
 		logmsg(c, "media links: %s", strerror(errno));
 		goto out;
 	}
@@ -869,32 +1058,41 @@ static int cam_start(struct cam *c)
 	    isp_geometry(cfg, &compose, &crop) < 0 ||
 	    subdev_fmt(phy_fd, 0, cfg->in_w, cfg->in_h, &code) < 0 ||
 	    subdev_fmt(csid_fd, 0, cfg->in_w, cfg->in_h, &code) < 0 ||
-	    subdev_fmt(csid_fd, 4, cfg->in_w, cfg->in_h, &code) < 0 ||
+	    subdev_fmt(csid_fd, csid_pad, cfg->in_w, cfg->in_h, &code) < 0 ||
 	    subdev_fmt(c->vfe_fd, 0, cfg->in_w, cfg->in_h, &code) < 0) {
 		logmsg(c, "sensor side formats: %s", strerror(errno));
 		goto out;
 	}
 
-	sel.r = compose;
-	if (xioctl(c->vfe_fd, VIDIOC_SUBDEV_S_SELECTION, &sel) < 0 ||
-	    sel.r.width != compose.width || sel.r.height != compose.height) {
-		logmsg(c, "ISP compose size: %s", strerror(errno));
-		goto out;
-	}
-	sel.pad = 1;
-	sel.target = V4L2_SEL_TGT_CROP;
-	sel.r = crop;
-	if (xioctl(c->vfe_fd, VIDIOC_SUBDEV_S_SELECTION, &sel) < 0 ||
-	    sel.r.width != crop.width || sel.r.height != crop.height ||
-	    sel.r.left != crop.left || sel.r.top != crop.top ||
-	    subdev_fmt(c->vfe_fd, 1, cfg->out_w, cfg->out_h, &yuv) < 0) {
-		logmsg(c, "ISP output size: %s", strerror(errno));
-		goto out;
+	if (raw) {
+		/* RDI retains every sensor sample. Its source format remains RAW10;
+		 * no PIX compose, crop, colour control or Bayer ISP is involved.
+		 */
+		if (quad_format(code, &raw_fourcc, &quad_cfa) < 0 ||
+		    subdev_fmt(c->vfe_fd, 1, cfg->in_w, cfg->in_h, &code) < 0)
+			goto out;
+	} else {
+		sel.r = compose;
+		if (xioctl(c->vfe_fd, VIDIOC_SUBDEV_S_SELECTION, &sel) < 0 ||
+		    sel.r.width != compose.width || sel.r.height != compose.height) {
+			logmsg(c, "ISP compose size: %s", strerror(errno));
+			goto out;
+		}
+		sel.pad = 1;
+		sel.target = V4L2_SEL_TGT_CROP;
+		sel.r = crop;
+		if (xioctl(c->vfe_fd, VIDIOC_SUBDEV_S_SELECTION, &sel) < 0 ||
+		    sel.r.width != crop.width || sel.r.height != crop.height ||
+		    sel.r.left != crop.left || sel.r.top != crop.top ||
+		    subdev_fmt(c->vfe_fd, 1, cfg->out_w, cfg->out_h, &yuv) < 0) {
+			logmsg(c, "ISP output size: %s", strerror(errno));
+			goto out;
+		}
 	}
 
-	f.fmt.pix_mp.width = cfg->out_w;
-	f.fmt.pix_mp.height = cfg->out_h;
-	f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+	f.fmt.pix_mp.width = raw ? cfg->in_w : cfg->out_w;
+	f.fmt.pix_mp.height = raw ? cfg->in_h : cfg->out_h;
+	f.fmt.pix_mp.pixelformat = raw ? raw_fourcc : V4L2_PIX_FMT_NV12;
 	f.fmt.pix_mp.field = V4L2_FIELD_NONE;
 	f.fmt.pix_mp.num_planes = 1;
 	if (xioctl(c->vid_fd, VIDIOC_S_FMT, &f) < 0 ||
@@ -902,29 +1100,30 @@ static int cam_start(struct cam *c)
 		logmsg(c, "video format: %s", strerror(errno));
 		goto out;
 	}
-	if (f.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12 ||
+	if (f.fmt.pix_mp.pixelformat != (raw ? raw_fourcc : V4L2_PIX_FMT_NV12) ||
 	    f.fmt.pix_mp.num_planes != 1 ||
-	    f.fmt.pix_mp.width != cfg->out_w ||
-	    f.fmt.pix_mp.height != cfg->out_h ||
+	    f.fmt.pix_mp.width != (raw ? cfg->in_w : cfg->out_w) ||
+	    f.fmt.pix_mp.height != (raw ? cfg->in_h : cfg->out_h) ||
 	    (cfg->out_w & 1) || (cfg->out_h & 1)) {
-		logmsg(c, "capture did not accept single-plane NV12 %ux%u", cfg->out_w,
-		       cfg->out_h);
+		logmsg(c, "capture did not accept single-plane %s %ux%u",
+		       raw ? "RAW10" : "NV12", cfg->out_w, cfg->out_h);
 		goto out;
 	}
+	c->colorspace = f.fmt.pix_mp.colorspace;
+	c->ycbcr_enc = f.fmt.pix_mp.ycbcr_enc;
+	c->quantization = f.fmt.pix_mp.quantization;
 	c->bpl = f.fmt.pix_mp.plane_fmt[0].bytesperline;
 	c->sizeimage = f.fmt.pix_mp.plane_fmt[0].sizeimage;
-	c->uv_offset = (size_t)c->bpl * cfg->out_h;
-	c->frame_span = c->uv_offset + (size_t)(cfg->out_h / 2 - 1) * c->bpl +
-			cfg->out_w;
-	if (c->bpl < cfg->out_w || c->sizeimage < c->frame_span) {
-		logmsg(c, "invalid NV12 layout: stride %u sizeimage %u span %zu", c->bpl,
-		       c->sizeimage, c->frame_span);
+	if (capture_layout(c) < 0)
 		goto out;
-	}
-	if (c->bpl != cfg->out_w) {
-		c->stage = malloc(frame_size(cfg));
-		if (!c->stage)
+	if (raw) {
+		int result = quad_worker_create(cfg->in_w, cfg->in_h, quad_cfa,
+						&c->quad_worker);
+		if (result < 0) {
+			errno = -result;
+			logmsg(c, "Quad CFA converter: %s", strerror(errno));
 			goto out;
+		}
 	}
 
 	if (xioctl(c->vid_fd, VIDIOC_REQBUFS, &rb) < 0 || rb.count < 2 ||
@@ -979,7 +1178,7 @@ static int cam_start(struct cam *c)
 		   c->again > c->ag_max ? c->ag_max : c->again;
 	apply_exposure(c);
 	apply_wb(c);
-	{
+	if (!raw) {
 		int32_t ccm[9];
 		struct v4l2_ext_control ec = {
 			.id = V4L2_CID_CAMSS_CCM,
@@ -992,10 +1191,21 @@ static int cam_start(struct cam *c)
 		memcpy(ccm, cfg->ccm, sizeof(ccm));
 		if (xioctl(c->vfe_fd, VIDIOC_S_EXT_CTRLS, &ecs) < 0)
 			logmsg(c, "colour matrix: %s", strerror(errno));
+		ctrl_set(c->vfe_fd, V4L2_CID_SATURATION, saturation);
+		ctrl_set(c->vfe_fd, V4L2_CID_CONTRAST, contrast);
 	}
-	ctrl_set(c->vfe_fd, V4L2_CID_SATURATION, saturation);
-	ctrl_set(c->vfe_fd, V4L2_CID_CONTRAST, contrast);
 
+	/* Kernel and owner are installed together. FRAME_SYNC is physical SOF
+	 * in CLOCK_MONOTONIC; the capture timestamp is physical EOF. Optional
+	 * subscription failure disables flash without preventing preview.
+	 */
+	piano_photo_timing_reset(&c->photo_timing);
+	c->frame_sync_subscribed = false;
+	if (!raw && !strcmp(cfg->name, "rear")) {
+		struct v4l2_event_subscription sub = { .type = V4L2_EVENT_FRAME_SYNC };
+
+		c->frame_sync_subscribed = xioctl(c->vid_fd, VIDIOC_SUBSCRIBE_EVENT, &sub) == 0;
+	}
 	if (xioctl(c->vid_fd, VIDIOC_STREAMON, &type) < 0) {
 		logmsg(c, "STREAMON: %s", strerror(errno));
 		goto out;
@@ -1008,6 +1218,10 @@ static int cam_start(struct cam *c)
 	c->ae_ready = false;
 	logmsg(c, "streaming %ux%u -> %ux%u NV12 (bayer 0x%04x)", cfg->in_w,
 	       cfg->in_h, cfg->out_w, cfg->out_h, code);
+	if (raw)
+		logmsg(c, "full Quad CFA via RDI: RAW10 stride %u sizeimage %u; "
+		       "software still conversion drops input frames while busy",
+		       c->bpl, c->sizeimage);
 	ret = 0;
 out:
 	if (phy_fd >= 0)
@@ -1043,8 +1257,10 @@ static void frame_stats(const struct cam *c, const uint8_t *y,
 
 	memset(s, 0, sizeof(*s));
 
-	for (unsigned int row = h / 32; row < h; row += h / 32) {
-		for (unsigned int col = w / 64; col < w; col += w / 64) {
+	unsigned int row_step = h < 32 ? 1 : h / 32;
+	unsigned int col_step = w < 64 ? 1 : w / 64;
+	for (unsigned int row = row_step; row < h; row += row_step) {
+		for (unsigned int col = col_step; col < w; col += col_step) {
 			unsigned int r = row & ~1u, cl = col & ~1u;
 			int Y = y[r * stride + cl];
 			int U = uv[(r / 2) * stride + cl] - 128;
@@ -1396,6 +1612,98 @@ static void af_update(struct cam *c, const uint8_t *y, unsigned int stride)
 	af_feed(c, af_sharpness(c, y, stride));
 }
 
+static void quad_controls(const struct cam *c, struct piano_quad_params *params)
+{
+	piano_quad_params_default(params);
+	/* JN1 factory RAW10 levels: white 1023, black 64 on all four channels. */
+	params->black_level = 64.0f;
+	params->digital_gain = (float)c->dgain / DGAIN_UNITY;
+	params->white_balance[0] = c->rgain;
+	params->white_balance[2] = c->bgain;
+	for (unsigned int i = 0; i < 9; i++)
+		params->ccm[i] = (float)c->cfg->ccm[i] / 1024;
+	params->saturation = (float)saturation / SAT_UNITY;
+	params->contrast = (float)contrast / 256;
+}
+
+/* Demosaic the full sensor first. A smaller client format then uses standard
+ * NV12 scaling with an even, centred crop; the native 50MP path makes no copy
+ * and never bins or enlarges a lower-resolution image.
+ */
+static const uint8_t *quad_output(struct cam *c, const uint8_t *frame)
+{
+	const struct cam_cfg *cfg = c->cfg;
+	unsigned int width = cfg->in_w, height = cfg->in_h;
+	unsigned int left, top;
+
+	if (cfg->out_w == width && cfg->out_h == height)
+		return frame;
+	if ((uint64_t)cfg->out_w * height < (uint64_t)cfg->out_h * width)
+		width = ((uint64_t)height * cfg->out_w / cfg->out_h) & ~1u;
+	else
+		height = ((uint64_t)width * cfg->out_h / cfg->out_w) & ~1u;
+	left = ((cfg->in_w - width) / 2) & ~1u;
+	top = ((cfg->in_h - height) / 2) & ~1u;
+	if (NV12Scale(frame + (size_t)top * cfg->in_w + left, cfg->in_w,
+		      frame + (size_t)cfg->in_w * cfg->in_h +
+			      (size_t)(top / 2) * cfg->in_w + left, cfg->in_w,
+		      width, height, c->stage, cfg->out_w,
+		      c->stage + (size_t)cfg->out_w * cfg->out_h, cfg->out_w,
+		      cfg->out_w, cfg->out_h, kFilterBox) < 0) {
+		errno = EIO;
+		return NULL;
+	}
+	return c->stage;
+}
+
+/* Only the copied CPU frame crosses the worker boundary. All camera controls,
+ * statistics, autofocus and loopback writes stay in the existing main loop.
+ */
+static void cam_quad_result(struct cam *c)
+{
+	struct quad_worker_result frame;
+	int result = quad_worker_take(c->quad_worker, &frame);
+
+	if (result < 0) {
+		if (result != -EAGAIN)
+			logmsg(c, "Quad CFA completion: %s", strerror(-result));
+		return;
+	}
+	if (frame.status < 0 ||
+	    frame.bytes != (size_t)c->cfg->in_w * c->cfg->in_h * 3 / 2) {
+		logmsg(c, "Quad CFA frame %u: %s", frame.sequence,
+		       strerror(frame.status < 0 ? -frame.status : EIO));
+	} else {
+		const uint8_t *output = quad_output(c, frame.nv12);
+
+		if (!output) {
+			logmsg(c, "Quad CFA resize: %s", strerror(errno));
+			goto release;
+		}
+		if (++c->frames % AE_PERIOD == 0) {
+			struct stats stats;
+
+			frame_stats(c, output,
+				    output + (size_t)c->cfg->out_w * c->cfg->out_h,
+				    c->cfg->out_w, &stats);
+			control_update(c, &stats);
+		}
+		af_update(c, output, c->cfg->out_w);
+		if (loopback_write_frame(c, output, &c->quad_timestamp, c->quad_timestamp_flags) < 0)
+			logmsg(c, "loopback write: %s", strerror(errno));
+		if (c->frames == 1)
+			logmsg(c, "full Quad CFA frame %u: unpack %.1f ms render %.1f ms "
+			       "working %.1f MiB", frame.sequence,
+			       frame.metrics.unpack_ns / 1e6,
+			       (frame.metrics.demosaic_ns + frame.metrics.color_ns) / 1e6,
+			       frame.metrics.working_bytes / 1048576.0);
+	}
+release:
+	result = quad_worker_release(c->quad_worker);
+	if (result < 0)
+		logmsg(c, "Quad CFA release: %s", strerror(-result));
+}
+
 static void cam_frame(struct cam *c)
 {
 	const struct cam_cfg *cfg = c->cfg;
@@ -1407,10 +1715,13 @@ static void cam_frame(struct cam *c)
 		.m.planes = pl,
 	};
 	const uint8_t *y, *uv, *out;
+	bool prepared = false;
 
 	if (xioctl(c->vid_fd, VIDIOC_DQBUF, &b) < 0) {
-		if (errno != EAGAIN)
+		if (errno != EAGAIN) {
 			logmsg(c, "DQBUF: %s", strerror(errno));
+			piano_photo_abort(&c->photo, errno, true);
+		}
 		return;
 	}
 
@@ -1421,6 +1732,7 @@ static void cam_frame(struct cam *c)
 		if (b.index >= c->nbufs || b.length != 1) {
 			logmsg(c, "invalid capture frame: index %u planes %u", b.index,
 			       b.length);
+			piano_photo_abort(&c->photo, EIO, true);
 			goto requeue;
 		}
 		mapped = &c->bufs[b.index];
@@ -1430,18 +1742,43 @@ static void cam_frame(struct cam *c)
 			logmsg(c, "incomplete capture frame: sequence %u index %u used %zu "
 			       "offset %zu length %u mapped %zu span %zu", b.sequence,
 			       b.index, used, offset, pl[0].length, mapped->len, c->frame_span);
+			piano_photo_abort(&c->photo, EIO, true);
 			goto requeue;
 		}
 		y = (const uint8_t *)mapped->ptr + offset;
-		uv = y + c->uv_offset;
+		if (c->quad_raw) {
+			struct piano_quad_params params;
+			int result;
 
-		if (++c->frames % AE_PERIOD == 0) {
+			quad_controls(c, &params);
+			result = quad_worker_submit(c->quad_worker, y, used - offset,
+						    c->bpl, &params, b.sequence);
+			prepared = result == 0;
+			if (prepared) {
+				/* The one in-flight worker result retains this source frame's
+				 * clock, even when rendering finishes seconds later.
+				 */
+				c->quad_timestamp = b.timestamp;
+				c->quad_timestamp_flags = b.flags;
+			}
+			if (result < 0 && result != -EBUSY)
+				logmsg(c, "RAW10 frame %u: %s", b.sequence, strerror(-result));
+			goto requeue;
+		}
+		uv = y + c->uv_offset;
+		bool recovering = c->photo_recover_frames > 0;
+		bool held = piano_photo_blocks_3a(&c->photo) || recovering;
+
+		camera_photo_frame(c, &b, y, uv, true);
+		held = held || piano_photo_blocks_3a(&c->photo);
+		if (recovering && !piano_photo_active(&c->photo)) c->photo_recover_frames--;
+		if (++c->frames % AE_PERIOD == 0 && !held) {
 			struct stats s;
 
 			frame_stats(c, y, uv, c->bpl, &s);
 			control_update(c, &s);
 		}
-		af_update(c, y, c->bpl);
+		if (!held) af_update(c, y, c->bpl);
 
 		out = y;
 		if (c->stage) {
@@ -1452,23 +1789,37 @@ static void cam_frame(struct cam *c)
 				       y + (size_t)r * c->bpl, cfg->out_w);
 			out = c->stage;
 		}
-		if (loopback_write_frame(c, out) < 0)
+		if (loopback_write_frame(c, out, &b.timestamp, b.flags) < 0)
 			logmsg(c, "loopback write: %s", strerror(errno));
 	}
 
+	else piano_photo_abort(&c->photo, EIO, true);
+
 requeue:
-	if (xioctl(c->vid_fd, VIDIOC_QBUF, &b) < 0)
+	if (xioctl(c->vid_fd, VIDIOC_QBUF, &b) < 0) {
 		logmsg(c, "QBUF after frame %u: %s", b.sequence, strerror(errno));
+		piano_photo_abort(&c->photo, errno, true);
+		/* A prepared copy is never started before its DMA buffer is back
+		 * with the driver. Stop rather than keep a partially queued stream.
+		 */
+		if (c->quad_raw)
+			cam_stop(c);
+		return;
+	}
+	if (prepared) {
+		int result = quad_worker_start(c->quad_worker);
+
+		if (result < 0) {
+			logmsg(c, "Quad CFA start: %s", strerror(-result));
+			cam_stop(c);
+		}
+	}
 }
 
 static int loopback_change_format(struct cam *c)
 {
 	struct v4l2_format format = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
 	struct v4l2_streamparm rate = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
-	struct v4l2_requestbuffers release = {
-		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT,
-		.memory = V4L2_MEMORY_MMAP,
-	};
 	struct cam_cfg mode = c->mode;
 	struct v4l2_rect compose, crop;
 
@@ -1485,11 +1836,20 @@ static int loopback_change_format(struct cam *c)
 		errno = EINVAL;
 		return -1;
 	}
-	if (xioctl(c->loop_fd, VIDIOC_REQBUFS, &release) < 0 ||
-	    loopback_format(c, mode.out_w, mode.out_h) < 0 ||
+	int result = loopback_output_clear(&c->loop_output);
+	if (result < 0) {
+		errno = -result;
+		return -1;
+	}
+	if (loopback_format(c, mode.out_w, mode.out_h) < 0 ||
 	    loopback_rate(c, fps) < 0)
 		return -1;
 	c->mode = mode;
+	result = loopback_output_setup(&c->loop_output, c->loop_fd, frame_size(c->cfg));
+	if (result < 0) {
+		errno = -result;
+		return -1;
+	}
 	/* Publishing this frame acknowledges the consumer's blocking S_FMT.
 	 * Actual camera DMA still starts only with the existing client-usage event.
 	 */
@@ -1523,12 +1883,16 @@ static void loopback_event(struct cam *c)
 		}
 		if (ev.type != V4L2_EVENT_PRI_CLIENT_USAGE)
 			continue;
+		c->loop_users = u->count;
+		if (!u->count && c->streaming && piano_photo_active(&c->photo))
+			c->photo_owned_stream = true;
 		if (u->count && !c->streaming) {
-			/* a current frame until the camera delivers */
-			loopback_black(c);
+			/* Capture STREAMON discards the negotiation frame. Only a
+			 * real frame from this stream may satisfy its first dequeue.
+			 */
 			cam_start(c);
 		}
-		else if (!u->count && c->streaming)
+		else if (!u->count && c->streaming && !piano_photo_active(&c->photo))
 			cam_stop(c);
 	}
 }
@@ -1562,6 +1926,8 @@ static void notify_ready(void)
 /* Fixed native controls, serialized with 3A by the existing owner loop. */
 #define CONTROL_PATH "/run/piano-camerad/control.sock"
 #define CONTROL_CLIENTS 4
+#define POLL_QUAD_RESULT (3 + CONTROL_CLIENTS)
+#define POLL_PHOTO_CANCEL (POLL_QUAD_RESULT + 1)
 static int control_fd = -1;
 static int control_clients[CONTROL_CLIENTS] = { -1, -1, -1, -1 };
 
@@ -1588,11 +1954,36 @@ static int control_node(const struct cam *c, unsigned int i)
 	return i == 5 ? c->vcm_fd : c->vfe_fd;
 }
 
+static bool control_software(const struct cam *c, unsigned int i)
+{
+	return c->quad_raw && i >= 2 && i <= 4;
+}
+
+static int control_query(struct cam *c, unsigned int i, struct v4l2_query_ext_ctrl *q)
+{
+	if (!control_software(c, i))
+		return xioctl(control_node(c, i), VIDIOC_QUERY_EXT_CTRL, q);
+	/* Keep the existing Q10 control protocol. These are the ranges actually
+	 * accepted by the software converter, not nonexistent RDI ISP controls.
+	 */
+	*q = (struct v4l2_query_ext_ctrl){
+		.id = named_controls[i].id, .type = V4L2_CTRL_TYPE_INTEGER,
+		.minimum = i == 2 ? DGAIN_UNITY : 1, .maximum = 16 * 1024 - 1,
+		.step = 1, .default_value = 1024,
+	};
+	return 0;
+}
+
 static int control_get(struct cam *c, unsigned int i, int *value)
 {
 	struct v4l2_control ctl = { .id = named_controls[i].id };
 	int fd = control_node(c, i);
 
+	if (control_software(c, i)) {
+		*value = i == 2 ? c->dgain :
+			(int)lround((i == 3 ? c->rgain : c->bgain) * WB_UNITY);
+		return 0;
+	}
 	if (fd < 0) {
 		errno = EOPNOTSUPP;
 		return -1;
@@ -1765,7 +2156,7 @@ static void control_report(FILE *out, struct cam *c, bool values)
 		query[i] = (struct v4l2_query_ext_ctrl){ .id = named_controls[i].id };
 		if (fd < 0)
 			continue;
-		if (xioctl(fd, VIDIOC_QUERY_EXT_CTRL, &query[i]) < 0) {
+		if (control_query(c, i, &query[i]) < 0) {
 			query_error[i] = errno;
 			complete = false;
 		} else if (values && control_get(c, i, &current[i]) < 0) {
@@ -1829,6 +2220,10 @@ static void control_request(FILE *out, const char *packet)
 		control_error(out, "inactive", ENODEV, false);
 		return;
 	}
+	if (!strcmp(verb, "set") && piano_photo_active(&c->photo)) {
+		control_error(out, "capture", EBUSY, false);
+		return;
+	}
 	if ((!strcmp(verb, "caps") || !strcmp(verb, "get")) && count == 2) {
 		control_report(out, c, !strcmp(verb, "get"));
 		return;
@@ -1890,7 +2285,7 @@ static void control_request(FILE *out, const char *packet)
 			control_error(out, "auto-owner", EBUSY, false);
 			return;
 		}
-		if (xioctl(fd, VIDIOC_QUERY_EXT_CTRL, &q) < 0) {
+		if (control_query(c, i, &q) < 0) {
 			control_error(out, "query", errno, false);
 			return;
 		}
@@ -1918,7 +2313,7 @@ static void control_request(FILE *out, const char *packet)
 			control_error(out, "range-or-flags", ERANGE, false);
 			return;
 		}
-		if (ctrl_set(fd, n->id, (int)requested) < 0) {
+		if (!control_software(c, i) && ctrl_set(fd, n->id, (int)requested) < 0) {
 			control_error(out, "set", errno, true);
 			return;
 		}
@@ -1958,6 +2353,281 @@ static void control_request(FILE *out, const char *packet)
 		return;
 	}
 	control_error(out, "control", EINVAL, false);
+}
+
+/* Drain physical events before dequeueing the associated capture buffer. */
+static void camera_frame_events(struct cam *c)
+{
+	struct v4l2_event event;
+
+	if (!c->frame_sync_subscribed) return;
+	while (xioctl(c->vid_fd, VIDIOC_DQEVENT, &event) == 0) {
+		if (event.type == V4L2_EVENT_FRAME_SYNC &&
+		    piano_photo_timing_event(&c->photo_timing, &event) < 0)
+			piano_photo_abort(&c->photo, EPIPE, true);
+	}
+	if (errno != EAGAIN && errno != ENOENT)
+		piano_photo_abort(&c->photo, errno, true);
+}
+
+static int photo_physical_times(struct cam *c, const struct v4l2_buffer *buffer,
+				struct piano_photo_frame *frame)
+{
+	const struct piano_photo_settings *settings = &c->photo.settings;
+	uint64_t lead = 0;
+
+	if (!c->frame_sync_subscribed || c->quad_raw) return -EOPNOTSUPP;
+	if (c->photo.frozen) {
+		uint64_t line = (settings->line_ns_num + settings->line_ns_den - 1) / settings->line_ns_den;
+
+		/* Original sensor exposure model: ADC offset 1ms plus one line.
+		 * End uses actual physical EOF, including the measured extra span.
+		 */
+		lead = settings->exposure_ns + UINT64_C(1000000) + line;
+	}
+	return piano_photo_timing_frame(&c->photo_timing, buffer, lead, frame);
+}
+
+static int flash_get(int fd, uint32_t id, int *value)
+{
+	struct v4l2_control control = { .id = id };
+
+	if (xioctl(fd, VIDIOC_G_CTRL, &control) < 0) return -errno;
+	*value = control.value;
+	return 0;
+}
+
+static int camera_flash_stop(void *context, uint64_t *call_ns, uint32_t *fault)
+{
+	struct cam *c = context;
+	int first_error = 0;
+
+	*call_ns = monotonic_ns();
+	*fault = 0;
+	for (unsigned int i = 0; i < c->flash_count; i++) {
+		struct camera_flash *flash = &c->flash[i];
+		int value = 0, ret;
+
+		if (flash->fd < 0) continue;
+		if (flash->configured) {
+			if (ctrl_set(flash->fd, V4L2_CID_FLASH_STROBE_STOP, 0) < 0 && !first_error)
+				first_error = errno;
+			ret = flash_get(flash->fd, V4L2_CID_FLASH_FAULT, &value);
+			if (ret < 0 && !first_error) first_error = -ret;
+			else if (ret == 0) *fault |= (uint32_t)value;
+			if (ctrl_set(flash->fd, V4L2_CID_FLASH_LED_MODE, V4L2_FLASH_LED_MODE_NONE) < 0 && !first_error)
+				first_error = errno;
+			if (flash->saved) {
+				if (ctrl_set(flash->fd, V4L2_CID_FLASH_TIMEOUT, flash->timeout) < 0 && !first_error)
+					first_error = errno;
+				if (ctrl_set(flash->fd, V4L2_CID_FLASH_INTENSITY, flash->intensity) < 0 && !first_error)
+					first_error = errno;
+				if (ctrl_set(flash->fd, V4L2_CID_FLASH_STROBE_SOURCE, flash->source) < 0 && !first_error)
+					first_error = errno;
+			}
+		}
+		close(flash->fd);
+		*flash = (struct camera_flash){ .fd = -1 };
+	}
+	c->flash_count = 0;
+	return -first_error;
+}
+
+static int camera_flash_open(struct cam *c)
+{
+	struct topo topology;
+	const struct media_v2_entity *sensor;
+	int media_fd = find_media(), error = ENODEV;
+
+	if (media_fd < 0) return -errno;
+	if (topo_load(&topology, media_fd) < 0) { close(media_fd); return -errno; }
+	sensor = topo_entity(&topology, c->cfg->sensor);
+	if (!sensor) goto out;
+	for (unsigned int i = 0; i < topology.t.num_links; i++) {
+		const struct media_v2_link *link = &topology.links[i];
+
+		if ((link->flags & MEDIA_LNK_FL_LINK_TYPE) != MEDIA_LNK_FL_ANCILLARY_LINK ||
+		    link->source_id != sensor->id) continue;
+		for (unsigned int j = 0; j < topology.t.num_entities; j++) {
+			const struct media_v2_entity *entity = &topology.ents[j];
+			struct camera_flash *flash;
+			int value = 0, ret;
+
+			if (entity->id != link->sink_id || entity->function != MEDIA_ENT_F_FLASH) continue;
+			if (c->flash_count == PHOTO_FLASH_CHANNELS) { error = E2BIG; goto out; }
+			flash = &c->flash[c->flash_count++];
+			*flash = (struct camera_flash){ .fd = topo_open_devnode(&topology, entity->id) };
+			if (flash->fd < 0) { error = errno; goto out; }
+#define READ_FLASH(id, field) do { \
+	ret = flash_get(flash->fd, id, &flash->field); \
+	if (ret < 0) { error = -ret; goto out; } \
+} while (0)
+			READ_FLASH(V4L2_CID_FLASH_LED_MODE, mode);
+			if (flash->mode != V4L2_FLASH_LED_MODE_NONE) { error = EBUSY; goto out; }
+			READ_FLASH(V4L2_CID_FLASH_STROBE_SOURCE, source);
+			READ_FLASH(V4L2_CID_FLASH_TIMEOUT, timeout);
+			READ_FLASH(V4L2_CID_FLASH_INTENSITY, intensity);
+#undef READ_FLASH
+			ret = flash_get(flash->fd, V4L2_CID_FLASH_FAULT, &value);
+			if (ret < 0) { error = -ret; goto out; }
+			if (value) { error = EIO; goto out; }
+			flash->timeout_range = (struct v4l2_query_ext_ctrl){ .id = V4L2_CID_FLASH_TIMEOUT };
+			if (xioctl(flash->fd, VIDIOC_QUERY_EXT_CTRL, &flash->timeout_range) < 0) {
+				error = errno; goto out;
+			}
+			flash->saved = true;
+		}
+	}
+	if (c->flash_count) error = 0;
+out:
+	topo_free(&topology);
+	close(media_fd);
+	if (error) {
+		uint64_t stop_ns; uint32_t fault;
+
+		(void)camera_flash_stop(c, &stop_ns, &fault);
+	}
+	return -error;
+}
+
+static bool camera_photo_ready(void *context)
+{
+	const struct cam *c = context;
+
+	return !c->photo_recover_frames && (c->ae_manual || c->ae_ready);
+}
+
+static int camera_photo_freeze(void *context, struct piano_photo_settings *settings)
+{
+	struct cam *c = context;
+	struct v4l2_query_ext_ctrl exposure = { .id = V4L2_CID_EXPOSURE };
+	struct v4l2_subdev_format format = { .which = V4L2_SUBDEV_FORMAT_ACTIVE, .pad = 0 };
+	struct exposure_timing timing;
+	struct v4l2_control blank = { .id = V4L2_CID_VBLANK };
+	int ret;
+
+	if (!c->streaming || c->quad_raw || !c->photo_timing.readout_ns || strcmp(c->cfg->sensor, "s5kjn1")) return -EOPNOTSUPP;
+	if (control_refresh(c, DOMAIN_AE) < 0 || control_refresh(c, DOMAIN_WB) < 0 ||
+	    (c->vcm_fd >= 0 && control_refresh(c, DOMAIN_AF) < 0) ||
+	    xioctl(c->sensor_fd, VIDIOC_QUERY_EXT_CTRL, &exposure) < 0 ||
+	    exposure_timing(c, &exposure, &timing) < 0 ||
+	    xioctl(c->sensor_fd, VIDIOC_SUBDEV_G_FMT, &format) < 0 ||
+	    xioctl(c->sensor_fd, VIDIOC_G_CTRL, &blank) < 0)
+		return -errno;
+	if (c->exposure <= 0 || blank.value < 0 || !format.format.height) return -ERANGE;
+	ret = camera_flash_open(c);
+	if (ret < 0) return ret;
+	memset(settings, 0, sizeof(*settings));
+	settings->line_ns_num = timing.line_ns_num; settings->line_ns_den = timing.line_ns_den;
+	settings->exposure_ns = ((uint64_t)c->exposure * timing.line_ns_num + timing.line_ns_den - 1) / timing.line_ns_den;
+	/* Observed physical SOF -> EOF, not a height/line-time estimate.
+	 * Acceptance still checks the selected frame's actual endpoints. */
+	settings->readout_ns = c->photo_timing.readout_ns;
+	settings->frame_ns = exposure_ns(&timing, (uint64_t)format.format.height + blank.value);
+	settings->exposure_lines = (uint32_t)c->exposure;
+	settings->native_width = format.format.width; settings->native_height = format.format.height;
+	settings->flash_channels = c->flash_count;
+	for (unsigned int i = 0; i < c->flash_count; i++) {
+		const struct v4l2_query_ext_ctrl *range = &c->flash[i].timeout_range;
+
+		if (range->type != V4L2_CTRL_TYPE_INTEGER || range->minimum <= 0 ||
+		    range->maximum < range->minimum || !range->step || range->maximum > INT_MAX) {
+			ret = -EOPNOTSUPP; goto fail;
+		}
+		if (i && (settings->pulse_min_ns != (uint64_t)range->minimum * 1000 ||
+			  settings->pulse_max_ns != (uint64_t)range->maximum * 1000 ||
+			  settings->pulse_step_ns != range->step * 1000)) {
+			ret = -EOPNOTSUPP; goto fail;
+		}
+		settings->pulse_min_ns = (uint64_t)range->minimum * 1000;
+		settings->pulse_max_ns = (uint64_t)range->maximum * 1000;
+		settings->pulse_step_ns = range->step * 1000;
+	}
+	c->saved_ae_manual = c->ae_manual; c->saved_wb_manual = c->wb_manual;
+	c->saved_af_manual = c->af_manual;
+	c->ae_manual = c->wb_manual = c->af_manual = true;
+	settings->freeze_ns = monotonic_ns();
+	return 0;
+fail:
+	{
+		uint64_t stop_ns; uint32_t fault;
+
+		(void)camera_flash_stop(c, &stop_ns, &fault);
+	}
+	return ret;
+}
+
+static int camera_flash_start(void *context, uint64_t pulse_ns, uint64_t *call_ns, uint64_t *return_ns)
+{
+	struct cam *c = context;
+
+	for (unsigned int i = 0; i < c->flash_count; i++) {
+		struct camera_flash *flash = &c->flash[i];
+
+		/* A failed control call may still have changed hardware. */
+		flash->configured = true;
+		if (ctrl_set(flash->fd, V4L2_CID_FLASH_TIMEOUT, (int)(pulse_ns / 1000)) < 0 ||
+		    ctrl_set(flash->fd, V4L2_CID_FLASH_STROBE_SOURCE, V4L2_FLASH_STROBE_SOURCE_SOFTWARE) < 0)
+			return -errno;
+		/* Mark before the call: a failed transport may still have changed
+		 * hardware, so cleanup must try STOP and NONE on this channel.
+		 */
+		if (ctrl_set(flash->fd, V4L2_CID_FLASH_LED_MODE, V4L2_FLASH_LED_MODE_FLASH) < 0)
+			return -errno;
+	}
+	*call_ns = monotonic_ns();
+	for (unsigned int i = 0; i < c->flash_count; i++)
+		if (ctrl_set(c->flash[i].fd, V4L2_CID_FLASH_STROBE, 0) < 0) return -errno;
+	*return_ns = monotonic_ns();
+	return 0;
+}
+
+static void camera_photo_restore(void *context)
+{
+	struct cam *c = context;
+
+	c->ae_manual = c->saved_ae_manual;
+	c->wb_manual = c->saved_wb_manual;
+	c->af_manual = c->saved_af_manual;
+	/* Do not feed the light pulse or the two in-flight frames into the
+	 * restored ambient-light AE/AWB/AF loops.
+	 */
+	c->photo_recover_frames = 2;
+}
+
+static const struct piano_photo_ops camera_photo_ops = {
+	.ready = camera_photo_ready, .freeze = camera_photo_freeze,
+	.start_flash = camera_flash_start, .stop_flash = camera_flash_stop,
+	.restore = camera_photo_restore,
+};
+
+static int camera_photo_request(struct cam *c, int client_fd)
+{
+	int ret;
+
+	if (strcmp(c->cfg->name, "rear") || c->cfg->in_w == 8160) return -EOPNOTSUPP;
+	if (piano_photo_active(&c->photo)) return -EBUSY;
+	if (!c->streaming) {
+		if (cam_start(c) < 0) return -errno;
+		c->photo_owned_stream = true;
+	}
+	ret = piano_photo_begin(&c->photo, client_fd, c->frame_sync_subscribed, monotonic_ns());
+	if (ret < 0 && c->photo_owned_stream && !c->loop_users) cam_stop(c);
+	return ret;
+}
+
+static void camera_photo_frame(struct cam *c, const struct v4l2_buffer *buffer,
+			       const uint8_t *y, const uint8_t *uv, bool complete)
+{
+	struct piano_photo_frame frame = {
+		.y = y, .uv = uv, .width = c->cfg->out_w, .height = c->cfg->out_h,
+		.stride = c->bpl, .colorspace = c->colorspace, .ycbcr_enc = c->ycbcr_enc,
+		.quantization = c->quantization, .sequence = buffer->sequence,
+		.now_ns = monotonic_ns(), .complete = complete,
+	};
+
+	frame.physical_timing = photo_physical_times(c, buffer, &frame) == 0;
+	if (piano_photo_active(&c->photo)) piano_photo_frame(&c->photo, &frame);
 }
 
 static int local_video_gid(gid_t *gid)
@@ -2055,6 +2725,30 @@ static void control_receive(unsigned int i)
 
 	if (n < 0 && (errno == EAGAIN || errno == EINTR))
 		return;
+	if (n > 0 && n < (ssize_t)sizeof(packet) && !memchr(packet, 0, (size_t)n)) {
+		packet[n] = 0;
+		if (!strncmp(packet, "capture ", 8)) {
+			char camera[16], mode[16], extra[2];
+			int ret = -EINVAL;
+
+			if (sscanf(packet, "capture %15s %15s %1s", camera, mode, extra) == 2 &&
+			    !strcmp(mode, "flash")) {
+				for (unsigned int k = 0; k < NUM_CAMS; k++)
+					if (!strcmp(camera, cams[k].cfg->name)) ret = camera_photo_request(&cams[k], fd);
+			}
+			control_clients[i] = -1;
+			if (ret < 0) {
+				struct piano_photo_result result = {
+					.magic = PIANO_PHOTO_MAGIC, .version = PIANO_PHOTO_VERSION,
+					.status = (uint32_t)-ret,
+				};
+
+				(void)piano_photo_send(fd, &result, -1);
+				close(fd);
+			}
+			return;
+		}
+	}
 	if (n > 0) {
 		FILE *out = open_memstream(&reply, &bytes);
 
@@ -2129,14 +2823,14 @@ int main(int argc, char **argv)
 	for (unsigned int i = 0; i < NUM_CAMS; i++) {
 		cams[i].mode = cam_cfgs[i];
 		cams[i].cfg = &cams[i].mode;
+		piano_photo_init(&cams[i].photo, &camera_photo_ops, &cams[i]);
+		for (unsigned int j = 0; j < PHOTO_FLASH_CHANNELS; j++) cams[i].flash[j].fd = -1;
 		cams[i].vid_fd = cams[i].sensor_fd = cams[i].vfe_fd =
 			cams[i].vcm_fd = -1;
 		if (loopback_init(&cams[i]) == 0)
 			ncams++;
-		else if (cams[i].loop_fd >= 0) {
-			close(cams[i].loop_fd);
-			cams[i].loop_fd = -1;
-		}
+		else if (cams[i].loop_fd >= 0)
+			loopback_close(&cams[i]);
 	}
 	if (!ncams) {
 		logmsg(NULL, "no camera outputs");
@@ -2145,22 +2839,32 @@ int main(int argc, char **argv)
 	control_fd = control_open();
 	if (control_fd < 0) {
 		logmsg(NULL, "control socket: %s", strerror(errno));
-		for (unsigned int i = 0; i < NUM_CAMS; i++)
+		for (unsigned int i = 0; i < NUM_CAMS; i++) {
 			cam_stop(&cams[i]);
+			loopback_close(&cams[i]);
+		}
 		return 1;
 	}
 	logmsg(NULL, "ready, %u camera(s)", ncams);
 	notify_ready();
 
 	while (!quit) {
-		struct pollfd pfd[2 * NUM_CAMS + 1 + CONTROL_CLIENTS];
-		struct cam *owner[2 * NUM_CAMS + 1 + CONTROL_CLIENTS];
-		unsigned int kind[2 * NUM_CAMS + 1 + CONTROL_CLIENTS];
+		struct pollfd pfd[4 * NUM_CAMS + 1 + CONTROL_CLIENTS];
+		struct cam *owner[4 * NUM_CAMS + 1 + CONTROL_CLIENTS];
+		unsigned int kind[4 * NUM_CAMS + 1 + CONTROL_CLIENTS];
 		unsigned int n = 0;
+		int timeout = 1000;
 
 		for (unsigned int i = 0; i < NUM_CAMS; i++) {
 			struct cam *c = &cams[i];
+			int photo_timeout = piano_photo_poll_timeout(&c->photo, monotonic_ns());
 
+			if (photo_timeout < timeout) timeout = photo_timeout;
+			if (piano_photo_active(&c->photo)) {
+				pfd[n] = (struct pollfd){ .fd = c->photo.client_fd, .events = POLLIN };
+				owner[n] = c;
+				kind[n++] = POLL_PHOTO_CANCEL;
+			}
 			if (c->loop_fd < 0)
 				continue;
 			pfd[n] = (struct pollfd){ .fd = c->loop_fd,
@@ -2169,9 +2873,15 @@ int main(int argc, char **argv)
 			kind[n++] = 0;
 			if (c->streaming) {
 				pfd[n] = (struct pollfd){ .fd = c->vid_fd,
-							  .events = POLLIN };
+							  .events = POLLIN | POLLPRI };
 				owner[n] = c;
 				kind[n++] = 1;
+				if (c->quad_worker) {
+					pfd[n] = (struct pollfd){ .fd = quad_worker_fd(c->quad_worker),
+								  .events = POLLIN };
+					owner[n] = c;
+					kind[n++] = POLL_QUAD_RESULT;
+				}
 			}
 		}
 
@@ -2186,7 +2896,7 @@ int main(int argc, char **argv)
 			kind[n++] = 3 + i;
 		}
 
-		if (poll(pfd, n, 1000) < 0) {
+		if (poll(pfd, n, timeout) < 0) {
 			if (errno == EINTR)
 				continue;
 			logmsg(NULL, "poll: %s", strerror(errno));
@@ -2199,19 +2909,48 @@ int main(int argc, char **argv)
 			if (kind[i] == 2) {
 				if (pfd[i].revents & POLLIN)
 					control_accept();
+			} else if (kind[i] == POLL_PHOTO_CANCEL) {
+				struct cam *c = owner[i];
+
+				if (piano_photo_active(&c->photo) && c->photo.client_fd == pfd[i].fd)
+					piano_photo_abort(&c->photo, ECANCELED, false);
+			} else if (kind[i] == POLL_QUAD_RESULT) {
+				/* A source-change event earlier in this poll batch may have
+				 * closed the old stream. Never consume its stale result fd.
+				 */
+				if (owner[i]->streaming && owner[i]->quad_worker &&
+				    pfd[i].fd == quad_worker_fd(owner[i]->quad_worker) &&
+				    (pfd[i].revents & POLLIN))
+					cam_quad_result(owner[i]);
 			} else if (kind[i] >= 3) {
 				control_receive(kind[i] - 3);
 			} else if (kind[i] == 1) {
-				if (owner[i]->streaming)
-					cam_frame(owner[i]);
+				struct cam *c = owner[i];
+
+				if (!c->streaming || c->vid_fd != pfd[i].fd) continue;
+				if (pfd[i].revents & (POLLHUP | POLLERR)) piano_photo_abort(&c->photo, EIO, true);
+				/* A physical SOF may be queued even when poll only reported
+				 * readable buffers. Drain first in either case. */
+				camera_frame_events(c);
+				if (pfd[i].revents & POLLIN) cam_frame(c);
 			} else if (pfd[i].revents & POLLPRI) {
 				loopback_event(owner[i]);
 			}
 		}
+		for (unsigned int i = 0; i < NUM_CAMS; i++) {
+			struct cam *c = &cams[i];
+
+			piano_photo_tick(&c->photo, monotonic_ns());
+			/* cam_frame has requeued the current DMA buffer by this point. */
+			if (!piano_photo_active(&c->photo) && c->photo_owned_stream && !c->loop_users)
+				cam_stop(c);
+		}
 	}
 
-	for (unsigned int i = 0; i < NUM_CAMS; i++)
+	for (unsigned int i = 0; i < NUM_CAMS; i++) {
 		cam_stop(&cams[i]);
+		loopback_close(&cams[i]);
+	}
 	control_close();
 	logmsg(NULL, "exit");
 

@@ -1,58 +1,58 @@
-"""Check real daemon geometry and format handoff without opening camera devices."""
+"""Build the maintained camera sources and execute their real native checks."""
 
+import json
 import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'tools'))
+import build_piano_runtime_helpers as runtime
 
 
 class PianoCameraTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        compiler = shlex.split(os.environ.get('CC', 'cc'))
-        if not compiler or not shutil.which(compiler[0]):
-            raise unittest.SkipTest('Native C compiler unavailable')
-        temporary = tempfile.TemporaryDirectory(prefix='piano-camera-')
-        cls.addClassCleanup(temporary.cleanup)
-        work = Path(temporary.name)
-        source = ROOT / 'linux/userspace/camera/piano-camerad.c'
-        cls.binary = work / 'camera-check'
-        subprocess.run([
-            *compiler, '-O2', f'-DPIANO_CAMERAD_SOURCE="{source}"',
-            str(ROOT / 'tests/native/test_piano_camera.c'), '-lm',
-            '-o', str(cls.binary),
-        ], check=True)
-
-    def check_camera(self, scenario):
-        result = subprocess.run([str(self.binary), scenario],
-                                capture_output=True, text=True, timeout=5)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_aspect_preserving_scaler_and_centered_crop(self):
-        self.check_camera('geometry')
-
-    def test_format_handoff_releases_output_before_full_black_frame(self):
-        self.check_camera('reconfigure')
-
-    def test_sensor_modes_do_not_advertise_unsupported_rates(self):
-        self.check_camera('modes')
-
-    def test_frame_period_uses_vt_pixel_rate_and_blanking(self):
-        self.check_camera('timing')
-
-    def test_front_full_resolution_uses_fixed_native_timing(self):
-        self.check_camera('front-timing')
-
-    def test_sixty_fps_handoff_selects_the_dedicated_sensor_mode(self):
-        self.check_camera('reconfigure60')
-
-    def test_failed_streamoff_retains_capture_buffers(self):
-        self.check_camera('stop-error')
+    def test_shared_camera_make_checks(self):
+        # The ordinary UEFI unit suite also runs without the optional camera
+        # development toolchain. Full camera builds run the same Make checks.
+        compiler = shlex.split(os.environ.get('CXX', 'c++'))
+        commands = [compiler, shlex.split(os.environ.get('CC', 'cc')),
+                    ['make'], ['cargo'], ['pkg-config']]
+        if any(not command or not shutil.which(command[0]) for command in commands):
+            self.skipTest('Native camera compiler, Cargo or pkg-config unavailable')
+        item = json.loads((ROOT / 'patches/demosaic/0.3.0/series.json').read_text())['source']
+        archive = ROOT / 'build/source-cache/camera' / (item['pname'] + '-' + item['version'] + '.crate')
+        if not archive.exists():
+            self.skipTest('Camera crate not cached; release-rootfs prepares it')
+        jpeg = subprocess.run(['pkg-config', '--cflags', '--libs', 'libjpeg'],
+                              capture_output=True, text=True)
+        if jpeg.returncode:
+            self.skipTest('Native libjpeg development files unavailable')
+        with tempfile.TemporaryDirectory(prefix='piano-camera-') as temporary:
+            work = Path(temporary)
+            flags = shlex.split(os.environ.get('YUV_CFLAGS', ''))
+            libraries = shlex.split(os.environ.get('YUV_LIBS', '-lyuv'))
+            dependency = subprocess.run(
+                [*compiler, '-x', 'c++', '-', *flags, *libraries,
+                 *shlex.split(jpeg.stdout), '-o', str(work / 'dependencies')],
+                input='#include <stdio.h>\n#include <jpeglib.h>\n#include <libyuv.h>\nint main() { return 0; }\n',
+                capture_output=True, text=True)
+            if dependency.returncode:
+                self.skipTest('Native libyuv/libjpeg development files unavailable')
+            source = work / 'camera'
+            shutil.copytree(ROOT / 'linux/userspace/camera', source,
+                            ignore=shutil.ignore_patterns('vendor', 'target'))
+            runtime.prepare_camera_quad(source, work, os.environ.copy())
+            # Native checks use the host target. Production runtime builds
+            # select aarch64 and target libraries through this same Makefile.
+            command = ['make', '-C', source, 'check', 'OUT=' + str(work / 'bin'),
+                       'YUV_CFLAGS=' + os.environ.get('YUV_CFLAGS', ''),
+                       'YUV_LIBS=' + os.environ.get('YUV_LIBS', '-lyuv')]
+            subprocess.run(command, check=True)
 
 
 if __name__ == '__main__':
