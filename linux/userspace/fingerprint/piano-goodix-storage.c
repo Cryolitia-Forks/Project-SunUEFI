@@ -50,6 +50,7 @@ struct storage_listener {
 struct goodix_storage {
 	atomic_uint references;
 	pthread_mutex_t mutex;
+	pthread_cond_t released;
 	struct storage_listener listeners[LISTENER_COUNT];
 	struct { int fd, handle; } files[FOPEN_MAX];
 	int next_handle, file_error;
@@ -535,7 +536,15 @@ static int32_t storage_invoke(ObjectCxt context, ObjectOp operation,
 		return Object_OK;
 	}
 	if (operation == Object_OP_release) {
-		if (atomic_fetch_sub(&storage->references, 1) == 1) {
+		/* Keep the predicate and notification under the same mutex: close
+		 * must not free storage before the releasing worker finishes using it.
+		 */
+		pthread_mutex_lock(&storage->mutex);
+		unsigned int remaining = atomic_fetch_sub(&storage->references, 1) - 1;
+		if (remaining == 1)
+			pthread_cond_signal(&storage->released);
+		pthread_mutex_unlock(&storage->mutex);
+		if (!remaining) {
 			for (size_t i = 0; i < LISTENER_COUNT; i++) {
 				if (storage->listeners[i].shared)
 					explicit_bzero(storage->listeners[i].shared, storage->listeners[i].size);
@@ -546,6 +555,7 @@ static int32_t storage_invoke(ObjectCxt context, ObjectOp operation,
 			}
 			storage_close_files(storage);
 			goodix_rpmb_close(storage->rpmb);
+			pthread_cond_destroy(&storage->released);
 			pthread_mutex_destroy(&storage->mutex);
 			free(storage);
 		}
@@ -701,7 +711,18 @@ static int storage_open(const char *directory, enum storage_mode mode,
 		goto done;
 	}
 	atomic_init(&storage->references, 1);
-	pthread_mutex_init(&storage->mutex, NULL);
+	int error = pthread_mutex_init(&storage->mutex, NULL);
+	if (!error) {
+		error = pthread_cond_init(&storage->released, NULL);
+		if (error)
+			pthread_mutex_destroy(&storage->mutex);
+	}
+	if (error) {
+		free(storage);
+		storage = NULL;
+		result = -error;
+		goto done;
+	}
 	storage->directory = fd;
 	storage->profile = profile;
 	fd = -1;
@@ -825,6 +846,15 @@ void goodix_storage_close(struct goodix_storage *storage)
 	pthread_mutex_unlock(&storage->mutex);
 	for (size_t i = 0; i < LISTENER_COUNT; i++)
 		Object_RELEASE_IF(storage->listeners[i].registration);
+
+	/* RegisterListenerCBO has no unregister operation. Its remote callback
+	 * release arrives on the still-running Mink workers after deregistration.
+	 * Each memory object retains that root until final destruction below.
+	 */
+	pthread_mutex_lock(&storage->mutex);
+	while (atomic_load(&storage->references) != 1)
+		pthread_cond_wait(&storage->released, &storage->mutex);
+	pthread_mutex_unlock(&storage->mutex);
 	Object callback = {storage_invoke, (ObjectCxt)&storage->listeners[0]};
 	Object_release(callback);
 }

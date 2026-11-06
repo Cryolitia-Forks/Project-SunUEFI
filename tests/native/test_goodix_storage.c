@@ -21,6 +21,7 @@ static int mutate_rpmb_shared, rpmb_ioctls;
 static int rpmb_failure_stage = -1, rpmb_short_transfer;
 static atomic_int pause_fsync;
 static sem_t callback_in_fsync, callback_continue, close_started, close_finished;
+static sem_t registrations_released;
 
 int __real_fsync(int fd);
 
@@ -474,6 +475,7 @@ static void rpmb_transfer_failures(struct goodix_storage *storage)
 struct listener_release {
 	struct storage_listener *listener;
 	int *registrations, *memories;
+	unsigned int total;
 };
 
 static int32_t registration_release(ObjectCxt context, ObjectOp operation,
@@ -488,6 +490,8 @@ static int32_t registration_release(ObjectCxt context, ObjectOp operation,
 	(*release->registrations)++;
 	Object callback = {storage_invoke, release->listener};
 	Object_release(callback);
+	if (*release->registrations == (int)release->total)
+		assert(!sem_post(&registrations_released));
 	return Object_OK;
 }
 
@@ -524,7 +528,7 @@ static void *close_storage(void *context)
 	return NULL;
 }
 
-static void listener_lifetime(int directory)
+static void listener_lifetime(int directory, unsigned int registered)
 {
 	struct goodix_storage *storage = calloc(1, sizeof(*storage));
 	struct listener_release releases[LISTENER_COUNT];
@@ -533,6 +537,7 @@ static void listener_lifetime(int directory)
 	assert(storage);
 	atomic_init(&storage->references, 1);
 	assert(!pthread_mutex_init(&storage->mutex, NULL));
+	assert(!pthread_cond_init(&storage->released, NULL));
 	assert(!mkdirat(directory, "listeners", 0700));
 	storage->directory = openat(directory, "listeners", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	assert(storage->directory >= 0);
@@ -549,7 +554,7 @@ static void listener_lifetime(int directory)
 	storage->rpmb = calloc(1, sizeof(*storage->rpmb));
 	assert(storage->rpmb);
 	storage->rpmb->fd = -1;
-	for (size_t i = 0; i < LISTENER_COUNT; ++i) {
+	for (size_t i = 0; i < registered; ++i) {
 		struct storage_listener *listener = &storage->listeners[i];
 		listener->storage = storage;
 		listener->service = i == 2 ? RPMB_SERVICE_ID :
@@ -560,7 +565,7 @@ static void listener_lifetime(int directory)
 		assert(listener->shared && listener->work);
 		memset(listener->shared, 0xa5, listener->size);
 		memset(listener->work, 0xa5, listener->size);
-		releases[i] = (struct listener_release){listener, &registrations, &memories};
+		releases[i] = (struct listener_release){listener, &registrations, &memories, registered};
 		listener->registration = (Object){registration_release, &releases[i]};
 		listener->memory = (Object){memory_release, &releases[i]};
 		Object callback = {storage_invoke, listener};
@@ -577,6 +582,7 @@ static void listener_lifetime(int directory)
 	 */
 	assert(!sem_init(&callback_in_fsync, 0, 0) && !sem_init(&callback_continue, 0, 0));
 	assert(!sem_init(&close_started, 0, 0) && !sem_init(&close_finished, 0, 0));
+	assert(!sem_init(&registrations_released, 0, 0));
 	struct storage_listener *gpfs = &storage->listeners[0];
 	tz_gpfile_write_req_t *write = gpfs->shared;
 	memset(write, 0, gpfs->size);
@@ -605,22 +611,22 @@ static void listener_lifetime(int directory)
 	assert(fcntl(owned_directory, F_GETFD) >= 0 && fcntl(owned_file, F_GETFD) >= 0);
 	assert(!storage->stopped && storage->allow_rpmb);
 	assert(!sem_post(&callback_continue));
-	assert(!pthread_join(callback_thread, NULL) && !pthread_join(close_thread, NULL));
-	assert(!sem_destroy(&callback_in_fsync) && !sem_destroy(&callback_continue));
-	assert(!sem_destroy(&close_started) && !sem_destroy(&close_finished));
-	assert(registrations == LISTENER_COUNT && !memories);
+	assert(!pthread_join(callback_thread, NULL));
+	assert(!sem_wait(&registrations_released));
+	assert(registrations == (int)registered && !memories);
+	assert(sem_trywait(&close_finished) == -1 && errno == EAGAIN);
 	assert(fcntl(owned_directory, F_GETFD) == -1 && errno == EBADF);
 	assert(fcntl(owned_file, F_GETFD) == -1 && errno == EBADF);
 	assert(!storage->allow_rpmb && storage->rpmb && storage->directory == -1);
 
-	/* A new native session can claim the real directory lock even though
-	 * old CBO references still own all three listener buffers.
+	/* Files are already drained, but close cannot finish until every remote
+	 * reference is returned. No shared buffer may be released in the meantime.
 	 */
 	int next = openat(directory, "listeners", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	assert(next >= 0 && !storage_claim_directory(next, 1));
 	expect_file(next, "inflight", "data", 4);
 	close(next);
-	for (size_t i = 0; i < LISTENER_COUNT; ++i) {
+	for (size_t i = 0; i < registered; ++i) {
 		struct storage_listener *listener = &storage->listeners[i];
 		memset(listener->shared, 0xa5, listener->size);
 		uint32_t wide = UINT32_MAX;
@@ -631,11 +637,20 @@ static void listener_lifetime(int directory)
 		for (size_t j = 0; j < listener->size; ++j)
 			assert(((uint8_t *)listener->shared)[j] == 0xa5);
 	}
-	for (size_t i = 0; i < LISTENER_COUNT; ++i) {
+	for (size_t i = 0; i < registered; ++i) {
 		Object callback = {storage_invoke, &storage->listeners[i]};
 		Object_release(callback);
+		if (i + 1 < registered) {
+			assert(!memories);
+			assert(sem_trywait(&close_finished) == -1 && errno == EAGAIN);
+		}
 	}
-	assert(memories == LISTENER_COUNT);
+	assert(!sem_wait(&close_finished));
+	assert(!pthread_join(close_thread, NULL));
+	assert(memories == (int)registered);
+	assert(!sem_destroy(&callback_in_fsync) && !sem_destroy(&callback_continue));
+	assert(!sem_destroy(&close_started) && !sem_destroy(&close_finished));
+	assert(!sem_destroy(&registrations_released));
 }
 
 int main(int argc, char **argv)
@@ -643,6 +658,7 @@ int main(int argc, char **argv)
 	assert(argc == 3);
 	struct goodix_storage storage = {
 		.mutex = PTHREAD_MUTEX_INITIALIZER,
+		.released = PTHREAD_COND_INITIALIZER,
 		.directory = storage_directory(argv[2]), .profile = 1,
 	};
 	assert(storage.directory >= 0 && storage_claim_directory(storage.directory, 1) == 0);
@@ -661,12 +677,15 @@ int main(int argc, char **argv)
 	else if (!strcmp(argv[1], "rpmb-failures"))
 		rpmb_transfer_failures(&storage);
 	else if (!strcmp(argv[1], "listeners"))
-		listener_lifetime(storage.directory);
+		listener_lifetime(storage.directory, LISTENER_COUNT);
+	else if (!strcmp(argv[1], "listeners-partial"))
+		listener_lifetime(storage.directory, 1);
 	else {
 		assert(!strcmp(argv[1], "handles"));
 		fs_handles(&storage, argv[2]);
 	}
 	close(storage.directory);
+	pthread_cond_destroy(&storage.released);
 	pthread_mutex_destroy(&storage.mutex);
 	return 0;
 }

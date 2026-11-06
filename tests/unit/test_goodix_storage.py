@@ -80,6 +80,9 @@ class GoodixStorageTests(unittest.TestCase):
     def test_fs_gpfs_and_rpmb_share_one_shutdown_and_cleared_memory_lifetime(self):
         self.check_files('listeners')
 
+    def test_failed_partial_registration_waits_for_its_remote_callback(self):
+        self.check_files('listeners-partial')
+
 
 if __name__ == '__main__':
     unittest.main()
