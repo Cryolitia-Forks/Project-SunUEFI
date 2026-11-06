@@ -11,17 +11,17 @@
   },
   "series": [
     {
-      "path": "0004-v4l2m2m-ffmpeg9-stateful.patch",
+      "path": "../../../linux/bsp/patches/ffmpeg/0004-v4l2m2m-ffmpeg9-stateful.patch",
       "sha256": "ad7b86872378f38fbbdf8a24e31726f62a765869b6f910322be6a8d8695b1a3c",
       "license": "LGPL-2.1-or-later; retain upstream file notices"
     },
     {
-      "path": "0005-v4l2m2m-orphan-capture-ffmpeg9.patch",
+      "path": "../../../linux/bsp/patches/ffmpeg/0005-v4l2m2m-orphan-capture-ffmpeg9.patch",
       "sha256": "b35c619d8467a15144db5ba58b4015884de71167f32b0c31fdb6f3b834e29bb3",
       "license": "LGPL-2.1-or-later; retain upstream file notices"
     },
     {
-      "path": "0006-v4l2m2m-p010-capture.patch",
+      "path": "../../../linux/bsp/patches/ffmpeg/0006-v4l2m2m-p010-capture.patch",
       "sha256": "2eeca4bcb88a54819c8211703eb3b6461e00a4fd122d5c405ff2764c08381044",
       "license": "LGPL-2.1-or-later; retain upstream file notices"
     }

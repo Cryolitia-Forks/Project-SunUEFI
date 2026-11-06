@@ -34,7 +34,7 @@
     "patch_series_by_abi": {
       "7": "linux/bsp/patches/ffmpeg/series.json",
       "8": "linux/bsp/patches/ffmpeg/series-8.json",
-      "9": "linux/bsp/patches/ffmpeg/series-9.json"
+      "9": "patches/ffmpeg/9.0.2/series.json"
     }
   },
   "kde_packages": [

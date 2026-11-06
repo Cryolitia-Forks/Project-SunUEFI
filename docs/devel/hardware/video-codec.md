@@ -1,7 +1,8 @@
 # Piano 视频编解码
 
 视频编解码使用 Linux 的 Qualcomm Iris 驱动和标准 V4L2 接口。FFmpeg 的适配放在
-[`linux/bsp/patches/ffmpeg/`](../../../linux/bsp/patches/ffmpeg/)，四个发行版的构建都会安装带补丁的完整软件包。
+[`linux/bsp/patches/ffmpeg/`](../../../linux/bsp/patches/ffmpeg/)；FFmpeg 9 的补丁顺序与来源由
+[`patches/ffmpeg/9.0.2/series.json`](../../../patches/ffmpeg/9.0.2/series.json) 记录。四个发行版的构建都会安装带补丁的完整软件包。
 
 ## 软件包与构建
 
@@ -20,7 +21,7 @@ Arch 构建器读取目标系统已安装包的编译选项、依赖和版本信
 ```sh
 python tools/prepare_ffmpeg_source.py --output build/ffmpeg-source-7
 python tools/prepare_ffmpeg_source.py \
-  --series linux/bsp/patches/ffmpeg/series-9.json \
+  --series patches/ffmpeg/9.0.2/series.json \
   --output build/ffmpeg-source-9
 ```
 
