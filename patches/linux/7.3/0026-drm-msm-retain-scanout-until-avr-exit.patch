@@ -1,0 +1,382 @@
+From c1a15242449cd8cd8e115832b666d5fb0802ac9d Mon Sep 17 00:00:00 2001
+From: Cryolitia PukNgae <cryolitia@gmail.com>
+Date: Fri, 6 Nov 2026 18:08:46 +0800
+Subject: [PATCH] drm/msm: retain scanout resources until bonded AVR exit is
+ confirmed
+
+The MSM prepare_commit hook runs after the atomic state swap. Returning
+from a failed AVR exit lets the commit continue into bridge shutdown or
+plane cleanup, even though an interface may still use its scanout buffer.
+
+Wait for the shared CTL flush and hardware frame counters on both bonded
+interfaces, then read back both DSI receivers after disabling AVR. If exit
+cannot be confirmed, fault AVR and keep the commit, power references and
+plane mappings alive while retrying. A frame timeout is not proof of DMA
+completion. Recovering a timed-out commit follows the same exit sequence
+before the helper can clean up its old planes.
+
+Do not use the delayed legacy-cursor flush when either old or new CRTC
+state has VRR enabled. That path retires old planes before its timer
+actually flushes hardware; VRR commits must retain them through wait_flush.
+
+Serialize AVR configuration and exit, retain receiver state across runtime
+restore, and drain AVR before CTL recovery, KMS unbind or machine shutdown.
+Once an exit has failed, keep fixed timing until the next full modeset.
+
+This does not publish a VRR capability or continuous panel timing range.
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c | 109 +++++++++++++++-----
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h |  10 +-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c     |  39 +++++--
+ drivers/gpu/drm/msm/dsi/dsi_host.c          |   9 ++
+ drivers/gpu/drm/msm/msm_atomic.c            |  10 +-
+ 5 files changed, 141 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 1e980c48a..0f5c14881 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -9,6 +9,7 @@
+ 
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ #include <linux/debugfs.h>
++#include <linux/iopoll.h>
+ #include <linux/kthread.h>
+ #include <linux/of.h>
+ #include <linux/seq_file.h>
+@@ -206,6 +207,7 @@ struct dpu_encoder_virt {
+ 	struct timer_list frame_done_timer;
+ 	u32 avr_max_vtotal;
+ 	bool avr_failed;
++	struct mutex avr_lock;
+ 
+ 	struct msm_display_info disp_info;
+ 
+@@ -785,7 +787,7 @@ u32 dpu_encoder_check_vrr(struct drm_encoder *encoder,
+ 		struct dpu_hw_intf *intf = enc->phys_encs[i]->hw_intf;
+ 
+ 		if (!intf || !intf->ops.setup_avr || !intf->ops.enable_avr ||
+-		    !intf->ops.trigger_avr ||
++		    !intf->ops.trigger_avr || !intf->ops.get_status ||
+ 		    mode->vtotal - mode->vsync_start < intf->cap->prog_fetch_lines_worst_case)
+ 			return 0;
+ 	}
+@@ -815,7 +817,7 @@ u32 dpu_encoder_vrr_timeout_ms(struct drm_encoder *encoder, u32 frames)
+ 			       mode->clock);
+ }
+ 
+-static int dpu_encoder_configure_vrr(struct drm_encoder *encoder, u32 max_vtotal)
++static int dpu_encoder_configure_vrr_locked(struct drm_encoder *encoder, u32 max_vtotal)
+ {
+ 	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
+ 	struct msm_drm_private *priv = encoder->dev->dev_private;
+@@ -859,7 +861,38 @@ static int dpu_encoder_configure_vrr(struct drm_encoder *encoder, u32 max_vtotal
+ 	return 0;
+ }
+ 
+-int dpu_encoder_exit_vrr(struct drm_encoder *encoder)
++static int dpu_encoder_configure_vrr(struct drm_encoder *encoder, u32 max_vtotal)
++{
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++	int ret;
++
++	mutex_lock(&enc->avr_lock);
++	ret = dpu_encoder_configure_vrr_locked(encoder, max_vtotal);
++	mutex_unlock(&enc->avr_lock);
++	return ret;
++}
++
++static bool dpu_encoder_vrr_flush_done(struct dpu_encoder_virt *enc,
++				     const u32 *frame_count)
++{
++	unsigned int i;
++
++	if (enc->cur_master->hw_ctl->ops.get_flush_register(enc->cur_master->hw_ctl))
++		return false;
++
++	/* A master IRQ does not prove the other half of a bonded panel advanced. */
++	for (i = 0; i < enc->num_phys_encs; i++) {
++		struct dpu_hw_intf *intf = enc->phys_encs[i]->hw_intf;
++		struct dpu_hw_intf_status status;
++
++		intf->ops.get_status(intf, &status);
++		if (!status.is_en || status.frame_count == frame_count[i])
++			return false;
++	}
++	return true;
++}
++
++static int dpu_encoder_exit_vrr(struct drm_encoder *encoder)
+ {
+ 	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
+ 	struct msm_drm_private *priv = encoder->dev->dev_private;
+@@ -867,7 +900,8 @@ int dpu_encoder_exit_vrr(struct drm_encoder *encoder)
+ 	struct dpu_hw_ctl *ctl;
+ 	unsigned long flags;
+ 	u32 index = enc->disp_info.h_tile_instance[0];
+-	u32 timeout_ms, vsync_count;
++	u32 timeout_ms, frame_count[MAX_PHYS_ENCODERS_PER_VIRTUAL];
++	bool done;
+ 	unsigned int i;
+ 	int ret;
+ 
+@@ -876,9 +910,6 @@ int dpu_encoder_exit_vrr(struct drm_encoder *encoder)
+ 
+ 	/* This runs before bridge disable while runtime PM and commit locks hold. */
+ 	ret = dpu_encoder_resource_control(encoder, DPU_ENC_RC_EVENT_KICKOFF);
+-	if (ret)
+-		return ret;
+-	ret = drm_crtc_vblank_get(enc->crtc);
+ 	if (ret)
+ 		return ret;
+ 	ctl = master->hw_ctl;
+@@ -893,39 +924,59 @@ int dpu_encoder_exit_vrr(struct drm_encoder *encoder)
+ 	}
+ 	/* Configuration-only flush: do not create a synthetic page-flip waiter. */
+ 	ctl->ops.trigger_flush(ctl);
+-	vsync_count = atomic_read(&master->vsync_cnt);
+ 	for (i = 0; i < enc->num_phys_encs; i++) {
+ 		struct dpu_hw_intf *intf = enc->phys_encs[i]->hw_intf;
++		struct dpu_hw_intf_status status;
+ 
++		intf->ops.get_status(intf, &status);
++		frame_count[i] = status.frame_count;
+ 		intf->ops.trigger_avr(intf);
+ 	}
+ 	spin_unlock_irqrestore(&enc->enc_spinlock, flags);
+ 
+-	ret = wait_event_timeout(master->pending_kickoff_wq,
+-				atomic_read(&master->vsync_cnt) != vsync_count &&
+-				!ctl->ops.get_flush_register(ctl),
+-				msecs_to_jiffies(timeout_ms));
+-	drm_crtc_vblank_put(enc->crtc);
+-	if (!ret) {
+-		WRITE_ONCE(enc->avr_failed, true);
+-		return -ETIMEDOUT;
+-	}
++	ret = read_poll_timeout(dpu_encoder_vrr_flush_done, done, done, 1000,
++				timeout_ms * 1000, false, enc, frame_count);
++	if (ret)
++		return ret;
+ 	ret = msm_dsi_set_avr(priv->kms->dsi[index], false);
+ 	if (!ret)
+ 		WRITE_ONCE(enc->avr_max_vtotal, 0);
+ 	return ret;
+ }
+ 
+-int dpu_encoder_prepare_vrr(struct drm_encoder *encoder, u32 max_vtotal,
+-			    bool modeset)
++void dpu_encoder_quiesce_vrr(struct drm_encoder *encoder, bool faulted)
++{
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++	int ret;
++
++	mutex_lock(&enc->avr_lock);
++	if (faulted)
++		WRITE_ONCE(enc->avr_failed, true);
++	while ((ret = dpu_encoder_exit_vrr(encoder))) {
++		WRITE_ONCE(enc->avr_failed, true);
++		/* The atomic state was already swapped. Returning here would let
++		 * the helper unpin the old scanout or disable the bridge/clocks.
++		 * Keep the commit, runtime PM and both plane states alive until
++		 * hardware acknowledges fixed timing on both interfaces. A frame
++		 * timeout alone is never permission to retire a DMA buffer.
++		 */
++		DPU_ERROR_ENC_RATELIMITED(enc,
++			"AVR exit unconfirmed (%d); retaining scanout resources\n", ret);
++		msleep(100);
++	}
++	mutex_unlock(&enc->avr_lock);
++}
++
++void dpu_encoder_prepare_vrr(struct drm_encoder *encoder, u32 max_vtotal,
++			     bool modeset)
+ {
+ 	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
+ 
+ 	if (!dpu_encoder_vrr_active(encoder) ||
+ 	    (!modeset && max_vtotal == enc->avr_max_vtotal &&
+ 	     !READ_ONCE(enc->avr_failed)))
+-		return 0;
+-	return dpu_encoder_exit_vrr(encoder);
++		return;
++	dpu_encoder_quiesce_vrr(encoder, false);
+ }
+ 
+ bool dpu_encoder_can_update_vfp(struct drm_encoder *encoder,
+@@ -1587,7 +1638,11 @@ void dpu_encoder_virt_runtime_resume(struct drm_encoder *drm_enc)
+ 	if (!dpu_enc->enabled)
+ 		goto out;
+ 
+-	WRITE_ONCE(dpu_enc->avr_max_vtotal, 0);
++	/* Restore programs fixed timing. Keep the receiver state accounted for
++	 * until the next serialized commit acknowledges AVR exit on both links.
++	 */
++	if (dpu_encoder_vrr_active(drm_enc))
++		WRITE_ONCE(dpu_enc->avr_failed, true);
+ 	if (dpu_enc->cur_slave && dpu_enc->cur_slave->ops.restore)
+ 		dpu_enc->cur_slave->ops.restore(dpu_enc->cur_slave);
+ 	if (dpu_enc->cur_master && dpu_enc->cur_master->ops.restore)
+@@ -2381,9 +2436,8 @@ void dpu_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc)
+ 	dpu_encoder_resource_control(drm_enc, DPU_ENC_RC_EVENT_KICKOFF);
+ 
+ 	/* Exit AVR before the CTL reset invalidates its flush handshake. */
+-	if (needs_hw_reset && dpu_encoder_vrr_active(drm_enc) &&
+-	    dpu_encoder_exit_vrr(drm_enc))
+-		DPU_ERROR_ENC(dpu_enc, "AVR exit failed before CTL recovery\n");
++	if (needs_hw_reset)
++		dpu_encoder_quiesce_vrr(drm_enc, true);
+ 
+ 	/* if any phys needs reset, reset all phys, in-order */
+ 	if (needs_hw_reset) {
+@@ -3091,6 +3145,7 @@ struct drm_encoder *dpu_encoder_init(struct drm_device *dev,
+ 	dpu_enc->enabled = false;
+ 	mutex_init(&dpu_enc->enc_lock);
+ 	mutex_init(&dpu_enc->rc_lock);
++	mutex_init(&dpu_enc->avr_lock);
+ 
+ 	ret = dpu_encoder_setup_display(dpu_enc, dpu_kms, disp_info);
+ 	if (ret) {
+@@ -3147,6 +3202,10 @@ int dpu_encoder_wait_for_commit_done(struct drm_encoder *drm_enc)
+ 				dpu_enc->commit_done_timedout = true;
+ 				msm_disp_snapshot_state(drm_enc->dev);
+ 			}
++			if (ret && ret != -EWOULDBLOCK && dpu_encoder_vrr_active(drm_enc)) {
++				dpu_encoder_quiesce_vrr(drm_enc, true);
++				return 0;
++			}
+ 			if (ret)
+ 				return ret;
+ 		}
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+index 67b605180..ae99f5841 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+@@ -28,9 +28,13 @@ u32 dpu_encoder_check_vrr(struct drm_encoder *encoder,
+ 			 struct drm_crtc_state *crtc_state);
+ bool dpu_encoder_vrr_active(struct drm_encoder *encoder);
+ u32 dpu_encoder_vrr_timeout_ms(struct drm_encoder *encoder, u32 frames);
+-int dpu_encoder_exit_vrr(struct drm_encoder *encoder);
+-int dpu_encoder_prepare_vrr(struct drm_encoder *encoder, u32 max_vtotal,
+-			    bool modeset);
++/* Process context in a serialized commit or KMS quiesce, with runtime PM held.
++ * Set faulted to prevent AVR re-entry until the next complete modeset. Does not
++ * return with an unacknowledged transition or release active DMA resources.
++ */
++void dpu_encoder_quiesce_vrr(struct drm_encoder *encoder, bool faulted);
++void dpu_encoder_prepare_vrr(struct drm_encoder *encoder, u32 max_vtotal,
++			     bool modeset);
+ int dpu_encoder_phys_vid_setup_avr(struct dpu_encoder_phys *phys, u32 max_vtotal);
+ 
+ bool dpu_encoder_can_update_vfp(struct drm_encoder *encoder,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+index 733086a02..3b4bde55c 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -470,17 +470,14 @@ static void dpu_kms_prepare_commit(struct msm_kms *kms,
+ 	struct drm_crtc_state *old_state, *new_state;
+ 	struct drm_crtc *crtc;
+ 	struct drm_encoder *encoder;
+-	int i, ret;
++	int i;
+ 
+ 	for_each_oldnew_crtc_in_state(state, crtc, old_state, new_state, i) {
+ 		u32 max_vtotal = to_dpu_crtc_state(new_state)->avr_max_vtotal;
+ 
+ 		drm_for_each_encoder_mask(encoder, to_dpu_kms(kms)->dev, old_state->encoder_mask) {
+-			ret = dpu_encoder_prepare_vrr(encoder, max_vtotal,
++			dpu_encoder_prepare_vrr(encoder, max_vtotal,
+ 					    drm_atomic_crtc_needs_modeset(new_state));
+-			if (ret)
+-				DRM_ERROR("encoder %u AVR exit failed: %d\n",
+-					  encoder->base.id, ret);
+ 		}
+ 	}
+ }
+@@ -1093,7 +1090,37 @@ static void dpu_kms_mdp_snapshot(struct msm_disp_state *disp_state, struct msm_k
+ 
+ static void dpu_kms_quiesce(struct msm_kms *kms)
+ {
+-	dpu_lutdma_quiesce(to_dpu_kms(kms)->lutdma);
++	struct dpu_kms *dpu_kms = to_dpu_kms(kms);
++	struct drm_encoder *encoder;
++	struct drm_crtc *crtc;
++	bool avr_active = false;
++	int ret;
++
++	dpu_lutdma_quiesce(dpu_kms->lutdma);
++
++	/* Unbind and shutdown may run without a commit owning the PM reference.
++	 * Keep all commit workers out until both receivers acknowledge exit.
++	 */
++	drm_for_each_crtc(crtc, kms->dev)
++		mutex_lock_nested(&kms->commit_lock[drm_crtc_index(crtc)],
++				  drm_crtc_index(crtc));
++
++	drm_for_each_encoder(encoder, kms->dev)
++		avr_active |= dpu_encoder_vrr_active(encoder);
++	if (avr_active) {
++		while ((ret = pm_runtime_resume_and_get(&dpu_kms->pdev->dev)) < 0) {
++			drm_err_ratelimited(kms->dev,
++				"AVR clocks unavailable (%d); teardown waits with mappings retained\n",
++				ret);
++			msleep(100);
++		}
++		drm_for_each_encoder(encoder, kms->dev)
++			dpu_encoder_quiesce_vrr(encoder, true);
++		pm_runtime_put_sync(&dpu_kms->pdev->dev);
++	}
++
++	list_for_each_entry_reverse(crtc, &kms->dev->mode_config.crtc_list, head)
++		mutex_unlock(&kms->commit_lock[drm_crtc_index(crtc)]);
+ }
+ 
+ static const struct msm_kms_funcs kms_funcs = {
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index f7fce0678..dd578ff6d 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -2746,6 +2746,15 @@ int msm_dsi_hosts_set_avr(struct mipi_dsi_host *master,
+ 	if (second)
+ 		dsi_host_write_avr(second, enable);
+ 
++	/* Drain posted writes before the caller may disable bridge clocks. Keep
++	 * its AVR state live if either receiver still advertises AVR enabled.
++	 */
++	if (!enable &&
++	    ((dsi_read(first, REG_DSI_VID_CFG0) & DSI_VID_CFG0_AVR_SUPPORT_ENABLE) ||
++	     (second && (dsi_read(second, REG_DSI_VID_CFG0) &
++			 DSI_VID_CFG0_AVR_SUPPORT_ENABLE))))
++		ret = -EIO;
++
+ unlock:
+ 	if (second)
+ 		mutex_unlock(&second->dev_mutex);
+diff --git a/drivers/gpu/drm/msm/msm_atomic.c b/drivers/gpu/drm/msm/msm_atomic.c
+index a8babf1db..43540bf8b 100644
+--- a/drivers/gpu/drm/msm/msm_atomic.c
++++ b/drivers/gpu/drm/msm/msm_atomic.c
+@@ -141,7 +141,7 @@ static bool can_do_async(struct drm_atomic_commit *state,
+ {
+ 	struct drm_connector_state *connector_state;
+ 	struct drm_connector *connector;
+-	struct drm_crtc_state *crtc_state;
++	struct drm_crtc_state *old_crtc_state, *crtc_state;
+ 	struct drm_crtc *crtc;
+ 	int i, num_crtcs = 0;
+ 
+@@ -152,7 +152,13 @@ static bool can_do_async(struct drm_atomic_commit *state,
+ 	for_each_new_connector_in_state(state, connector, connector_state, i)
+ 		return false;
+ 
+-	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
++	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, crtc_state, i) {
++		/* The delayed cursor flush drops old plane pins before hardware
++		 * consumes the update. VRR and its transitions must wait for the
++		 * actual flush before retiring any old scanout buffer.
++		 */
++		if (old_crtc_state->vrr_enabled || crtc_state->vrr_enabled)
++			return false;
+ 		if (drm_atomic_crtc_needs_modeset(crtc_state))
+ 			return false;
+ 		if (!crtc_state->active)

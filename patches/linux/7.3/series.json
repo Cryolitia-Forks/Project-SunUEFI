@@ -4,8 +4,8 @@
   "kernel_version": "7.3.0",
   "base_commit": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
   "base_tree": "30fd2ef82912c26cf3a58ad0ba6afc375fa851ac",
-  "target_tree": "e9e46f6641850fb80fdae47dcafee4d12fa098e9",
-  "original_target_commit": "ada687cae527c0c4dcaa159fd071dd9c9459b041",
+  "target_tree": "74c202f587fd2cdaf4a8c91910cdb9e7b67907c2",
+  "original_target_commit": "c1a15242449cd8cd8e115832b666d5fb0802ac9d",
   "source_url": "https://github.com/torvalds/linux.git",
   "patches": [
     {
@@ -207,6 +207,14 @@
       "original_parent": "220cdeac7e4ec4e1a8bc4c2400c71fa00b21b084",
       "committer_date": "2026-11-06T06:31:07+08:00",
       "tree": "e9e46f6641850fb80fdae47dcafee4d12fa098e9"
+    },
+    {
+      "original_commit": "c1a15242449cd8cd8e115832b666d5fb0802ac9d",
+      "tree": "74c202f587fd2cdaf4a8c91910cdb9e7b67907c2",
+      "original_parent": "ada687cae527c0c4dcaa159fd071dd9c9459b041",
+      "committer_date": "2026-11-06T18:18:22+08:00",
+      "file": "0026-drm-msm-retain-scanout-until-avr-exit.patch",
+      "sha256": "a178f2465902937f7ecae6340555b48cc752881f9a673d96a8ff97ed75ffd962"
     }
   ],
   "provenance": {

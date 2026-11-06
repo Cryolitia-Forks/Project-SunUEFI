@@ -25,7 +25,9 @@ CSOT 时序切换命令选择 page 0x10、解锁，然后按 B2、B3 顺序写�
 | 90 Hz | 0x00 | 0x80 |
 
 `qcom,mdss-dsi-timing-switch-video-command-state` 为 `dsi_hs_mode`。
-BOE 的命令顺序相反，不能将 CSOT 顺序用于所有面板。
+两家面板的 timing-switch-video-command 都按 B2、B3 顺序发送。
+BOE 在 on-command 初始化段按 B3、B2 顺序发送，和时序切换命令不同，
+不能混用这两个序列。
 
 ## 代码路径
 
@@ -86,3 +88,37 @@ BOE 的命令顺序相反，不能将 CSOT 顺序用于所有面板。
 
 最终 DT 的本地文本缓存 SHA-256：
 `e243e388d76d329dad88ef92d1484de9acc9c6204359fc1d9a3524a4c53362f9`。
+
+## 连续 VRR 的驱动与面板边界
+
+`feat/drm-avr` 分支实现双 DSI 的 DPU AVR 提交路径，使用 DRM 的
+`VRR_ENABLED` 属性控制，通过共享 CTL 提交后同时触发两个接口。
+它没有为 P81 面板公布 `vrr_capable` 或连续刷新范围，因此正常镜像
+继续使用固定刷新率。[固定档位切换](display-resume.md)与连续 VRR
+是两条不同的能力边界。
+
+AVR 退出先提交固定周期，等待 CTL flush 清零和两侧 INTF 的硬件帧
+计数都推进，再关闭两侧 DSI 接收器的 AVR 位并读回。原子提交、CTL
+恢复、卸载和关机都经过同一个退出流程。退出超时将禁用 AVR 重入，
+并阻塞当前提交或销毁，保留电源、时钟、plane 映射和原子状态；
+超时本身不表示 DMA 已停止。硬件确认退出后才继续普通提交或关闭
+链路，完整 modeset 后才允许重新尝试 AVR。
+VRR 开启或切换期间，光标提交也使用同步 flush 路径，先确认硬件
+消费更新再释放旧 framebuffer 的映射，避免延迟光标更新提前清理
+旧画面。
+
+面板接入仍需分别确认 CSOT 与 BOE 的连续周期限制和 DDIC 设置。
+原厂 DFPS 的 120/60、90/50/48/30、144 Hz 分属不同的时序和命令组；
+这些离散档位不能直接转成 30～144 Hz 的连续范围。同一时序组拥有
+多个固定档位，也不能证明其间任意前沿长度都被面板接受。
+[CSOT 配置](https://github.com/MiCode/vendor_qcom_opensource_display-devicetree/blob/cc4e65ad4bd54e26b60f5a8ee76bbc3cca6821b9/display/dsi-panel-p81-35-02-0b-dualdsi-dsc-lcd-video.dtsi)、
+[BOE 配置](https://github.com/MiCode/vendor_qcom_opensource_display-devicetree/blob/cc4e65ad4bd54e26b60f5a8ee76bbc3cca6821b9/display/dsi-panel-p81-42-02-0a-dualdsi-dsc-lcd-video.dtsi)
+和它们引用的[公共配置](https://github.com/MiCode/vendor_qcom_opensource_display-devicetree/blob/cc4e65ad4bd54e26b60f5a8ee76bbc3cca6821b9/display/dsi-panel-p81-p82-dualdsi-dsc-lcd-video-common.dtsi)
+都没有声明 QSync 最低频率或连续 VRR 范围。
+
+Mutter 50 已原生处理 connector 的 `vrr_capable`、CRTC 的
+`VRR_ENABLED` 和全屏窗口的可变帧时钟，不需要恢复旧版 GNOME 的
+VRR 实验开关。面板开放能力之前，不应通过桌面补丁绕过驱动限制。
+开放后的验收应记录两侧真实帧周期随应用提交间隔变化，检查双屏
+接缝、underrun、固定与可变模式切换，以及熄屏、恢复和退出失败；
+仅看到属性置位不算连续 VRR 正常工作。
