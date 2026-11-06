@@ -9,7 +9,14 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
 ---
 --- a/camera/piano-camerad.c
 +++ b/camera/piano-camerad.c
-@@ -60,6 +60,19 @@
+@@ -50,4 +50,5 @@
+-#define NUM_BUFS	4
++/* CAMSS keeps two hardware addresses; requeue each completed buffer. */
++#define NUM_BUFS	2
+ #define AE_TARGET	112.0	/* mean luma, gamma encoded */
+ #define AE_PERIOD	3	/* frames between control updates */
+ #define AE_STARTUP_UPDATES 10	/* bounded acquisition, then steady tracking */
+@@ -60,6 +61,19 @@
  #define DEF_SATURATION	100	/* percent */
  #define DEF_CONTRAST	96	/* S curve share of the tone curve, of 256 */
  
@@ -29,7 +36,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  struct cam_cfg {
  	const char *name;
  	const char *label;	/* v4l2loopback card label */
-@@ -71,6 +84,9 @@
+@@ -71,6 +85,9 @@
  	const char *vcm;	/* focus actuator entity prefix, or NULL */
  	unsigned int in_w, in_h;	/* sensor mode */
  	unsigned int out_w, out_h;	/* ISP output (MN downscaler) */
@@ -39,7 +46,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  	bool hflip, vflip;	/* sensor readout flips for an upright image */
  	int again_unit;		/* analogue gain control value for 1x */
  	double fps;
-@@ -80,17 +96,15 @@
+@@ -80,17 +97,15 @@
  /* qcom-camss PIX line control: colour correction matrix, 3x3 s32, Q10 */
  #define V4L2_CID_CAMSS_CCM	(V4L2_CID_USER_BASE | 0x1ff0)
  
@@ -60,7 +67,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  		.vflip = true, .again_unit = 1, .fps = 30,
  		/* mean of the stock tuning matrices */
  		.ccm = { 1732, -667, -40, -230, 1337, -82, -93, -989, 2106 },
-@@ -101,6 +115,8 @@
+@@ -101,6 +116,8 @@
  		.csid = "msm_csid1", .vfe = "msm_vfe1_pix",
  		.video = "msm_vfe1_video3",
  		.in_w = 3264, .in_h = 2448, .out_w = 1920, .out_h = 1440,
@@ -69,7 +76,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  		.again_unit = 256, .fps = 30,
  		.ccm = { 1649, -375, -251, -245, 1525, -255, -169, -308, 1501 },
  	},
-@@ -116,6 +132,7 @@
+@@ -116,6 +133,7 @@
  #define AF_HIST		64	/* sharpness samples kept per scan */
  
  struct cam {
@@ -77,7 +84,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  	const struct cam_cfg *cfg;
  	int loop_fd;
  	bool streaming;
-@@ -151,6 +168,7 @@
+@@ -151,6 +169,7 @@
  
  static struct cam cams[NUM_CAMS];
  static volatile sig_atomic_t quit;
@@ -85,7 +92,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  static double srgb_lin[256];
  static int saturation = DEF_SATURATION * SAT_UNITY / 100;
  static int contrast = DEF_CONTRAST;
-@@ -383,6 +401,29 @@
+@@ -383,6 +402,29 @@
  	return f.format.width == w && f.format.height == h ? 0 : -1;
  }
  
@@ -115,7 +122,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  static int ctrl_set(int fd, uint32_t id, int val)
  {
  	struct v4l2_control c = { .id = id, .value = val };
-@@ -493,27 +534,16 @@
+@@ -493,27 +535,16 @@
  	return ret;
  }
  
@@ -150,7 +157,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  	f.fmt.pix.sizeimage = size;
  	/* full range BT.601 YCbCr, sRGB transfer */
  	f.fmt.pix.colorspace = V4L2_COLORSPACE_JPEG;
-@@ -523,28 +553,84 @@
+@@ -523,28 +554,84 @@
  		return -1;
  	}
  	if (f.fmt.pix.pixelformat != V4L2_PIX_FMT_NV12 ||
@@ -253,7 +260,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  	return 0;
  }
  
-@@ -566,7 +652,7 @@
+@@ -566,7 +653,7 @@
  		 (int)lround(c->bgain * WB_UNITY));
  }
  
@@ -262,7 +269,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  {
  	struct v4l2_requestbuffers rb = {
  		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-@@ -575,7 +661,10 @@
+@@ -575,7 +662,10 @@
  	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
  
  	if (c->vid_fd >= 0) {
@@ -274,7 +281,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  		for (int i = 0; i < NUM_BUFS; i++)
  			if (c->bufs[i].ptr)
  				munmap(c->bufs[i].ptr, c->bufs[i].len);
-@@ -598,6 +687,83 @@
+@@ -598,6 +688,83 @@
  	if (c->streaming)
  		logmsg(c, "stopped after %lu frames", c->frames);
  	c->streaming = false;
@@ -358,7 +365,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  }
  
  static int cam_start(struct cam *c)
-@@ -619,6 +785,7 @@
+@@ -619,6 +786,7 @@
  		.memory = V4L2_MEMORY_MMAP,
  	};
  	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -366,7 +373,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  
  	c->vid_fd = c->sensor_fd = c->vfe_fd = c->vcm_fd = -1;
  
-@@ -690,7 +857,9 @@
+@@ -690,7 +858,9 @@
  	ctrl_set(c->sensor_fd, V4L2_CID_HFLIP, cfg->hflip);
  	ctrl_set(c->sensor_fd, V4L2_CID_VFLIP, cfg->vflip);
  
@@ -377,7 +384,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  	    subdev_fmt(phy_fd, 0, cfg->in_w, cfg->in_h, &code) < 0 ||
  	    subdev_fmt(csid_fd, 0, cfg->in_w, cfg->in_h, &code) < 0 ||
  	    subdev_fmt(csid_fd, 4, cfg->in_w, cfg->in_h, &code) < 0 ||
-@@ -699,9 +868,18 @@
+@@ -699,9 +869,18 @@
  		goto out;
  	}
  
@@ -398,7 +405,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  	    subdev_fmt(c->vfe_fd, 1, cfg->out_w, cfg->out_h, &yuv) < 0) {
  		logmsg(c, "ISP output size: %s", strerror(errno));
  		goto out;
-@@ -1276,6 +1454,44 @@
+@@ -1276,6 +1455,44 @@
  		logmsg(c, "QBUF after frame %u: %s", b.sequence, strerror(errno));
  }
  
@@ -443,7 +450,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  static void loopback_event(struct cam *c)
  {
  	struct v4l2_event ev;
-@@ -1283,6 +1499,21 @@
+@@ -1283,6 +1500,21 @@
  	while (!xioctl(c->loop_fd, VIDIOC_DQEVENT, &ev)) {
  		const struct v4l2_event_client_usage *u = (const void *)&ev.u;
  
@@ -465,7 +472,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  		if (ev.type != V4L2_EVENT_PRI_CLIENT_USAGE)
  			continue;
  		if (u->count && !c->streaming) {
-@@ -1396,59 +1627,58 @@
+@@ -1396,59 +1628,58 @@
  		"\"write_attempted\":%s}\n", stage, error, attempted ? "true" : "false");
  }
  
@@ -564,7 +571,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  }
  
  static uint64_t exposure_ns(const struct exposure_timing *timing, uint64_t lines)
-@@ -1881,7 +2111,8 @@
+@@ -1881,7 +2112,8 @@
  	}
  
  	for (unsigned int i = 0; i < NUM_CAMS; i++) {
@@ -574,7 +581,7 @@ and exposure. Keep the 1920x1440 default and two physical camera entries.
  		cams[i].vid_fd = cams[i].sensor_fd = cams[i].vfe_fd =
  			cams[i].vcm_fd = -1;
  		if (loopback_init(&cams[i]) == 0)
-@@ -1968,5 +2199,5 @@
+@@ -1968,5 +2200,5 @@
  	control_close();
  	logmsg(NULL, "exit");
  

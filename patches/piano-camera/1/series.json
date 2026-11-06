@@ -3,7 +3,7 @@
   "patches": [
     {
       "file": "0001-output-format-negotiation.patch",
-      "sha256": "a4a2123e0aa9d8130a9fc9c36555919be3b6f8662d619a638db2fc99c2bf6e48"
+      "sha256": "84740685bf3b750614b6549fa4d30173a5711659d24790c956ec40d456ad2fec"
     }
   ]
 }

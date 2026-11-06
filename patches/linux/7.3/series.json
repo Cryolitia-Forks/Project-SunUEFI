@@ -4,8 +4,8 @@
   "kernel_version": "7.3.0",
   "base_commit": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
   "base_tree": "30fd2ef82912c26cf3a58ad0ba6afc375fa851ac",
-  "target_tree": "6dde6991e0d0bb9be8984e770dad1d6372c420d2",
-  "original_target_commit": "e19647a57227174c8073332871bf978cfa201b51",
+  "target_tree": "4235eaae33992f5f353988e2d4eca22c1c94860c",
+  "original_target_commit": "eb385e7e9f7c7f817c967989e2a94877fa96fe8f",
   "source_url": "https://github.com/torvalds/linux.git",
   "patches": [
     {
@@ -247,6 +247,14 @@
       "original_parent": "705c2fa8b07ac30f6e5c16e2609648d29b86a6c6",
       "committer_date": "2026-11-06T15:45:00+00:00",
       "tree": "6dde6991e0d0bb9be8984e770dad1d6372c420d2"
+    },
+    {
+      "file": "0031-media-camss-full-height-nv12.patch",
+      "sha256": "ad48b08ae2bd2ce4a9d757e03b20679938664cce8d5a3ba6e19e1ac76e556c06",
+      "original_commit": "eb385e7e9f7c7f817c967989e2a94877fa96fe8f",
+      "original_parent": "e19647a57227174c8073332871bf978cfa201b51",
+      "committer_date": "2026-11-07T00:40:00+08:00",
+      "tree": "4235eaae33992f5f353988e2d4eca22c1c94860c"
     }
   ],
   "provenance": {
