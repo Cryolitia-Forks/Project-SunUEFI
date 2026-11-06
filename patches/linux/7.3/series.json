@@ -4,8 +4,8 @@
   "kernel_version": "7.3.0",
   "base_commit": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
   "base_tree": "30fd2ef82912c26cf3a58ad0ba6afc375fa851ac",
-  "target_tree": "7dcb4f397f7495a293a3c9c32207f6bd83afb2ef",
-  "original_target_commit": "1020655a351ef916ed2f37d91faed55bfc0996cd",
+  "target_tree": "e2810111bc0e8cf2aea1cf24438aea92f4a9b668",
+  "original_target_commit": "fecc42d7c23e2253e03549d8e1860710935277aa",
   "source_url": "https://github.com/torvalds/linux.git",
   "patches": [
     {
@@ -271,6 +271,14 @@
       "original_parent": "986f7e1a38f36c82e5c7108d53fe77b96bc37d23",
       "committer_date": "2026-11-07T07:14:52+08:00",
       "tree": "7dcb4f397f7495a293a3c9c32207f6bd83afb2ef"
+    },
+    {
+      "file": "0034-media-s5kjn1-readonly-hblank.patch",
+      "sha256": "88acec91bb001028d3a8d22c77d2660675f37106abf0743b2d07e90cc46ddcf2",
+      "original_commit": "fecc42d7c23e2253e03549d8e1860710935277aa",
+      "original_parent": "1020655a351ef916ed2f37d91faed55bfc0996cd",
+      "committer_date": "2026-11-07T07:32:36+08:00",
+      "tree": "e2810111bc0e8cf2aea1cf24438aea92f4a9b668"
     }
   ],
   "provenance": {
