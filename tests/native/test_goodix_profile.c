@@ -126,6 +126,50 @@ static void failures(int directory)
 	check_same(directory, &original);
 }
 
+static void initialization_failure(int directory)
+{
+	struct linux_profile empty = { .linux_uid = 1000, .group = 0x400003e8 };
+	struct profile_session session = { .directory = directory, .profile = empty };
+	struct rlimit previous, limit;
+
+	/* Exercise a real failed first metadata write after both private
+	 * subdirectories exist. No controller or secure application is opened.
+	 */
+	assert(!getrlimit(RLIMIT_FSIZE, &previous));
+	limit = previous;
+	limit.rlim_cur = 16;
+	signal(SIGXFSZ, SIG_IGN);
+	assert(!setrlimit(RLIMIT_FSIZE, &limit));
+	assert(profile_open_files(&session, 1) == -EFBIG);
+	assert(!setrlimit(RLIMIT_FSIZE, &previous));
+	assert(session.gatekeeper_directory >= 0);
+	close(session.gatekeeper_directory);
+	assert(profile_load(directory, &session.profile) == -ENOENT);
+
+	/* Retrying initializes the existing directories and leaves a readable
+	 * empty profile even if the subsequent sensor or Gatekeeper step fails.
+	 */
+	assert(!profile_open_files(&session, 1));
+	close(session.gatekeeper_directory);
+	check_same(directory, &empty);
+	assert(!profile_open_files(&session, 0));
+	close(session.gatekeeper_directory);
+	check_same(directory, &empty);
+
+	/* Opening for another enrollment never replaces a saved identity or
+	 * interrupted template transaction with the initial empty record.
+	 */
+	struct linux_profile saved = example();
+	saved.pending_finger = 3;
+	saved.pending_id = 33;
+	assert(!profile_save(directory, &saved));
+	session.profile = empty;
+	assert(!profile_open_files(&session, 1));
+	close(session.gatekeeper_directory);
+	assert(!memcmp(&session.profile, &saved, sizeof(saved)));
+	check_same(directory, &saved);
+}
+
 static int queried(void *context)
 {
 	return *(int *)context;
@@ -246,6 +290,7 @@ int main(int argc, char **argv)
 	else if (!strcmp(argv[1], "recovery")) recovery(directory);
 	else if (!strcmp(argv[1], "boundaries")) boundaries(directory);
 	else if (!strcmp(argv[1], "failures")) failures(directory);
+	else if (!strcmp(argv[1], "initialization-failure")) initialization_failure(directory);
 	else if (!strcmp(argv[1], "cancellation")) cancellation();
 	else if (!strcmp(argv[1], "gatekeeper-window")) gatekeeper_window();
 	else assert(0);

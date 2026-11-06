@@ -1072,6 +1072,32 @@ static int profile_save(int directory, const struct linux_profile *profile)
 	return result;
 }
 
+static int profile_open_files(struct profile_session *session, int create)
+{
+	int directory = session->directory;
+	int result = profile_load(directory, &session->profile);
+	int missing = result == -ENOENT;
+
+	if (missing)
+		result = create ? 0 : -EUCLEAN;
+	if (result)
+		return result;
+	session->gatekeeper_directory = private_directory(directory, "gatekeeper", create);
+	if (session->gatekeeper_directory < 0)
+		return session->gatekeeper_directory == -ENOENT ? -EUCLEAN :
+			session->gatekeeper_directory;
+	int fpdata = private_directory(directory, "fpdata", create);
+	if (fpdata < 0)
+		return fpdata == -ENOENT ? -EUCLEAN : fpdata;
+	close(fpdata);
+
+	/* Publish an empty profile before any TA operation. A later initialization
+	 * or Gatekeeper failure must not leave a UID that breaks storage listing.
+	 * Existing identities, templates and pending saves remain untouched.
+	 */
+	return missing ? profile_save(directory, &session->profile) : 0;
+}
+
 static int profile_open(struct profile_session *session, uint32_t linux_uid, int create)
 {
 	char name[16];
@@ -1104,22 +1130,9 @@ static int profile_open(struct profile_session *session, uint32_t linux_uid, int
 	if (directory < 0)
 		return directory;
 	session->directory = directory;
-	result = profile_load(directory, &session->profile);
-	if (result == -ENOENT)
-		result = create ? 0 : -EUCLEAN;
-	if (result)
-		return result;
-	session->gatekeeper_directory = private_directory(directory, "gatekeeper", create);
-	if (session->gatekeeper_directory < 0)
-		return session->gatekeeper_directory == -ENOENT ? -EUCLEAN :
-			session->gatekeeper_directory;
-	int fpdata = private_directory(directory, "fpdata", create);
-	if (fpdata < 0)
-		return fpdata == -ENOENT ? -EUCLEAN : fpdata;
-	close(fpdata);
 	snprintf(session->fpdata, sizeof(session->fpdata), "/var/lib/piano-goodix/%u/fpdata",
 		 linux_uid);
-	return 0;
+	return profile_open_files(session, create);
 }
 
 static int session_close(struct profile_session *session, int result)

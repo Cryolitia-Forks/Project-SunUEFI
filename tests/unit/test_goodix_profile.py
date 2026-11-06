@@ -60,6 +60,9 @@ class GoodixProfileTests(unittest.TestCase):
     def test_failed_atomic_replacement_preserves_previous_profile(self):
         self.check_profile('failures')
 
+    def test_failed_initialization_can_reopen_empty_profile(self):
+        self.check_profile('initialization-failure')
+
     def test_signal_and_synchronized_callback_cancellation(self):
         self.check_profile('cancellation')
 
