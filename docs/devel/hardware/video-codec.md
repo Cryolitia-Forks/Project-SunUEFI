@@ -2,7 +2,7 @@
 
 视频编解码使用 Linux 的 Qualcomm Iris 驱动和标准 V4L2 接口。FFmpeg 的适配放在
 [`linux/bsp/patches/ffmpeg/`](../../../linux/bsp/patches/ffmpeg/)；FFmpeg 9 的补丁顺序与来源由
-[`patches/ffmpeg/9.0.2/series.json`](../../../patches/ffmpeg/9.0.2/series.json) 记录。四个发行版的构建都会安装带补丁的完整软件包。
+[`patches/ffmpeg/9.0.2/series.json`](../../../patches/ffmpeg/9.0.2/series.json) 记录。各系统的构建都会安装带补丁的完整软件包。
 
 ## 软件包与构建
 
@@ -11,6 +11,11 @@
 | Debian GNOME / KDE | 7.1.5，保留 Debian 打包配置 | `tools/build_ffmpeg_packages.py` |
 | SteamOS | 7.1.5，兼容其原有 7.x 库接口 | `tools/build_arch_ffmpeg.py` |
 | Nyarch | 9.0.2，保持当前 Arch 库接口 | `tools/build_arch_ffmpeg.py` |
+| NixOS | 保留 nixpkgs 的完整构建配置 | `xiaomi-piano-nixos/modules/piano/video.nix` 的全局 overlay |
+
+NixOS 的硬件模块通过 `nixpkgs.overlays` 替换 FFmpeg 7、9 及其 headless/full
+变体，应用依赖使用同一套修复后的库。补丁按各版本 manifest 的顺序加载，
+每个补丁单独校验与导入；共享源码中无关文件的改动不会触发 FFmpeg 重编。
 
 Arch 构建器读取目标系统已安装包的编译选项、依赖和版本信息，保留完整编解码功能，
 重新生成 pacman 包。不会把 FFmpeg 9 降级成 7，也不会用精简调试程序覆盖系统软件。
@@ -41,6 +46,25 @@ FFmpeg 7 使用固定的 Debian orig 归档；FFmpeg 9 使用官方 9.0.2 归档
 输入文件结束与分辨率切换分别处理。STOP 只在两个队列都运行时发送，EOS 通知
 不会直接丢弃尚未取出的画面。非阻塞 DQEVENT 返回 ENOENT 表示事件队列为空，
 不作为解码错误；其他 I/O 错误仍返回给调用者。
+
+## 硬件编码
+
+FFmpeg 9 的编码补丁修正了三处问题：
+
+1. 请求标准的 `V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME`，
+   将 H.264/H.265 序列头与首帧一起返回，避免单独的序列头包占用首帧时间戳。
+2. 向 Iris 的 NV12/NV21 输入缓冲区复制画面时，按源图像的可见行数读取，
+   按驱动协商的 stride 和填充高度定位 UV 平面。2160 行的源画面不会再被当作
+   2176 行读取，设备侧的底部、右侧和对齐空间会初始化。
+3. 只在 OUTPUT 和 CAPTURE 两个队列都已开始传输时发送 STOP，此前退出直接结束。
+   已运行队列的 STOP 错误会交给调用者，避免输出容器初始化失败后一直等待 LAST。
+
+Iris 实机已分别将 3840×2160、60 fps 的合成输入编码为 120 帧 H.264 和 HEVC
+MPEG-TS，帧数完整且 DTS 严格递增。后摄 NV12 输入也已完成 H.264 硬件编码。
+
+这些修复没有实现编码器的 `AV_CODEC_FLAG_GLOBAL_HEADER`：直接输出要求在写容器头前
+就提供 SPS/PPS 的 Matroska 仍会失败，但会正常返回错误。不能将正常编码 MPEG-TS
+推导为所有输出容器都已支持。
 
 ## 已验证与剩余问题
 

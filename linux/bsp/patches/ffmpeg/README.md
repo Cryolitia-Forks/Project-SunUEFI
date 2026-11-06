@@ -1,7 +1,7 @@
-# FFmpeg stateful decoder BSP adaptation
+# FFmpeg stateful V4L2 BSP adaptation
 
 The default rootfs builders install complete distribution packages with the
-stateful V4L2 decoder fixes:
+stateful V4L2 codec fixes:
 
 | Target | Source and patch series | Package builder |
 | --- | --- | --- |
@@ -14,6 +14,12 @@ epoch and library ABI. A different upstream ABI needs its own patch port.
 Source archives and patches are checksum-pinned and applied without fuzz.
 Stage a copy with `tools/prepare_ffmpeg_source.py --output build/<new-directory>`;
 add `--series patches/ffmpeg/9.0.2/series.json` for FFmpeg 9.
+
+The FFmpeg 9 manifest also includes the Iris encoder fixes: join sequence
+headers to the first frame, copy visible NV12/NV21 rows into the negotiated
+padded surface, and stop cleanly when a muxer fails before streaming starts.
+NixOS applies that same manifest through its global FFmpeg overlay, preserving
+the upstream package configuration and all codec variants.
 
 Real Iris hardware has decoded and encoded the 12-frame H.264 sample with
 both versions. The full FFmpeg 9 package was built and installed on Nyarch.
