@@ -31,7 +31,7 @@ class GoodixStorageTests(unittest.TestCase):
         subprocess.run([
             *compiler, '-std=c17', '-O2', '-Wall', '-Wextra', '-Werror',
             '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections',
-            '-Wl,--wrap=malloc', '-Wl,--wrap=ioctl',
+            '-Wl,--wrap=malloc', '-Wl,--wrap=ioctl', '-Wl,--wrap=fsync',
             *[f'-I{path}' for path in includes],
             str(ROOT / 'tests/native/test_goodix_storage.c'),
             '-pthread', '-o', str(cls.binary),

@@ -1502,6 +1502,7 @@ int piano_goodix_verify(uint32_t linux_uid, unsigned int finger,
 	uint32_t allowed[10];
 	size_t count = 0;
 	uint64_t challenge;
+	const char *stage = "opening Linux profile";
 
 	if (finger > 10 || !matched_finger)
 		return -EINVAL;
@@ -1511,11 +1512,15 @@ int piano_goodix_verify(uint32_t linux_uid, unsigned int finger,
 	int result = profile_open(&session, linux_uid, 0);
 	if (result)
 		goto done;
+	stage = "initializing sensor and Keymaster binding";
 	result = session_start(&session, 0);
-	if (!result)
+	if (!result) {
+		stage = "enumerating Linux templates";
 		result = profile_reconcile(&session);
+	}
 	if (result)
 		goto done;
+	stage = "selecting enrolled finger";
 	for (size_t i = 0; i < 10; ++i)
 		if (session.profile.templates[i] && (!finger || finger == i + 1))
 			allowed[count++] = session.profile.templates[i];
@@ -1527,6 +1532,7 @@ int piano_goodix_verify(uint32_t linux_uid, unsigned int finger,
 		result = -EIO;
 		goto done;
 	}
+	stage = "preparing authentication";
 	result = grow_operation_buffer(&session.client, GOODIX_EVENT_BUFFER_BYTES);
 	struct goodix_events events = {
 		.command = sensor_command_status, .context = &session.client,
@@ -1537,11 +1543,17 @@ int piano_goodix_verify(uint32_t linux_uid, unsigned int finger,
 	if (!result)
 		result = goodix_operation_start_authenticate(&operation, &events, session.profile.group,
 			session.profile.sid, challenge, allowed, count, session.geometry.interaction_policy);
-	if (!result)
+	if (!result) {
+		stage = "capturing fingerprint";
 		result = run_operation(&session, &operation, finger, matched_finger, options);
+	}
 done:
 	clear_sensitive(&operation, sizeof(operation));
-	return session_close(&session, result);
+	int closed = session_close(&session, result);
+	if (closed)
+		fprintf(stderr, "Fingerprint verification failed while %s: error=%d\n",
+			result ? stage : "closing sensor and storage", closed);
+	return closed;
 }
 
 int piano_goodix_list(uint32_t linux_uid, unsigned int fingers[10], size_t *count)

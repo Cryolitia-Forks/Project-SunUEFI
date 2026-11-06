@@ -197,6 +197,9 @@ int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event 
 			events->state = GOODIX_EVENTS_FAILED;
 			return -EREMOTEIO;
 		}
+		fprintf(stderr, "Goodix capture: outcome=%s application=%d operation=%u phase=%u\n",
+			event->outcome == GOODIX_EVENT_NOT_MATCH ? "not-match" : "quality-retry",
+			status, event->operation, event->phase);
 	}
 	/* HAL 0x42774..0x42834 completes image/FF authentication with UPDATE_CONFIG
 	 * (1109) and AUTHENTICATE_FINISH (1086). FIDO takes 0x424a0 -> 0x427cc and

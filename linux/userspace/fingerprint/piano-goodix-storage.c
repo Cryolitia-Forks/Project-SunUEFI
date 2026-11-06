@@ -509,6 +509,21 @@ static int storage_rpmb_deny_dispatch(void *buffer, size_t size)
 	return 0;
 }
 
+static void storage_close_files(struct goodix_storage *storage)
+{
+	for (size_t i = 0; i < FOPEN_MAX; i++) {
+		if (!storage->files[i].handle)
+			continue;
+		close(storage->files[i].fd);
+		storage->files[i].fd = -1;
+		storage->files[i].handle = 0;
+	}
+	if (storage->directory >= 0) {
+		close(storage->directory);
+		storage->directory = -1;
+	}
+}
+
 static int32_t storage_invoke(ObjectCxt context, ObjectOp operation,
 			      ObjectArg *args, ObjectCounts counts)
 {
@@ -529,11 +544,7 @@ static int32_t storage_invoke(ObjectCxt context, ObjectOp operation,
 					explicit_bzero(storage->listeners[i].work, storage->listeners[i].size);
 				free(storage->listeners[i].work);
 			}
-			for (size_t i = 0; i < FOPEN_MAX; i++)
-				if (storage->files[i].handle)
-					close(storage->files[i].fd);
-			if (storage->directory >= 0)
-				close(storage->directory);
+			storage_close_files(storage);
 			goodix_rpmb_close(storage->rpmb);
 			pthread_mutex_destroy(&storage->mutex);
 			free(storage);
@@ -635,8 +646,11 @@ static int storage_claim_directory(int fd, int profile)
 		return -errno;
 	if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0777) != 0700)
 		return -EACCES;
-	if (flock(fd, LOCK_EX | LOCK_NB))
-		return -errno;
+	if (flock(fd, LOCK_EX | LOCK_NB)) {
+		int error = errno == EWOULDBLOCK ? EBUSY : errno;
+		fprintf(stderr, "Fingerprint storage unavailable: stage=fpdata-lock error=%d\n", error);
+		return -error;
+	}
 	if (profile)
 		return 0;
 	scan = dup(fd);
@@ -801,6 +815,13 @@ void goodix_storage_close(struct goodix_storage *storage)
 		return;
 	pthread_mutex_lock(&storage->mutex);
 	storage->stopped = 1;
+	storage->allow_rpmb = 0;
+	/* Every FS/GPFS/RPMB request holds this mutex. Drain the current request
+	 * and return the directory lock before the caller unlocks the sensor.
+	 * Late CBO references keep shared buffers alive, but stopped requests
+	 * cannot use the closed files or start another protected-storage call.
+	 */
+	storage_close_files(storage);
 	pthread_mutex_unlock(&storage->mutex);
 	for (size_t i = 0; i < LISTENER_COUNT; i++)
 		Object_RELEASE_IF(storage->listeners[i].registration);

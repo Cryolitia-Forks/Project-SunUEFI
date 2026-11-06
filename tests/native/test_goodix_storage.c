@@ -8,6 +8,7 @@
 #include "../../linux/userspace/fingerprint/piano-goodix-rpmb.c"
 
 #include <assert.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <sys/resource.h>
@@ -18,6 +19,23 @@
 static uint8_t buffer[BUFFER_BYTES], work[BUFFER_BYTES];
 static int mutate_rpmb_shared, rpmb_ioctls;
 static int rpmb_failure_stage = -1, rpmb_short_transfer;
+static atomic_int pause_fsync;
+static sem_t callback_in_fsync, callback_continue, close_started, close_finished;
+
+int __real_fsync(int fd);
+
+int __wrap_fsync(int fd)
+{
+	if (atomic_exchange(&pause_fsync, 0)) {
+		assert(!sem_post(&callback_in_fsync));
+		int result;
+		do {
+			result = sem_wait(&callback_continue);
+		} while (result && errno == EINTR);
+		assert(!result);
+	}
+	return __real_fsync(fd);
+}
 
 static void private_frame_fields(uint8_t *frame)
 {
@@ -273,7 +291,7 @@ static void fs_handles(struct goodix_storage *storage, const char *directory)
 	assert(((tz_file_close_rsp_t *)buffer)->ret == 0 && fcntl(fd, F_GETFD) == -1);
 
 	int second = storage_directory(directory);
-	assert(second >= 0 && storage_claim_directory(second, 1) == -EWOULDBLOCK);
+	assert(second >= 0 && storage_claim_directory(second, 1) == -EBUSY);
 	close(second);
 	close(storage->directory);
 	storage->directory = storage_directory(directory);
@@ -465,6 +483,8 @@ static int32_t registration_release(ObjectCxt context, ObjectOp operation,
 	(void)args;
 	assert(operation == Object_OP_release && counts == 0);
 	assert(release->listener->storage->stopped);
+	assert(release->listener->storage->directory == -1);
+	assert(!release->listener->storage->files[0].handle);
 	(*release->registrations)++;
 	Object callback = {storage_invoke, release->listener};
 	Object_release(callback);
@@ -485,6 +505,25 @@ static int32_t memory_release(ObjectCxt context, ObjectOp operation,
 	return Object_OK;
 }
 
+static void *pending_file_write(void *context)
+{
+	struct storage_listener *listener = context;
+	uint32_t wide;
+	ObjectArg args[6] = { [1].b = { &wide, sizeof(wide) } };
+
+	assert(storage_invoke(listener, 0, args, ObjectCounts_pack(0, 2, 0, 4)) == Object_OK);
+	assert(!((tz_gpfile_write_rsp_t *)listener->shared)->err);
+	return NULL;
+}
+
+static void *close_storage(void *context)
+{
+	assert(!sem_post(&close_started));
+	goodix_storage_close(context);
+	assert(!sem_post(&close_finished));
+	return NULL;
+}
+
 static void listener_lifetime(int directory)
 {
 	struct goodix_storage *storage = calloc(1, sizeof(*storage));
@@ -494,15 +533,27 @@ static void listener_lifetime(int directory)
 	assert(storage);
 	atomic_init(&storage->references, 1);
 	assert(!pthread_mutex_init(&storage->mutex, NULL));
-	storage->directory = dup(directory);
+	assert(!mkdirat(directory, "listeners", 0700));
+	storage->directory = openat(directory, "listeners", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	assert(storage->directory >= 0);
+	assert(!storage_claim_directory(storage->directory, 1));
 	int owned_directory = storage->directory;
+	assert(!write_range(storage, "file", "data", 4, 0, 0));
+	tz_file_open_req_t *request = (void *)buffer;
+	memset(buffer, 0, sizeof(buffer));
+	request->cmd_id = TZ_FS_MSG_CMD_FILE_OPEN;
+	path(request->pathname, "file");
+	assert(!storage_fs_dispatch(storage, buffer, sizeof(buffer)));
+	assert(((tz_file_open_rsp_t *)buffer)->ret > 0);
+	int owned_file = storage->files[0].fd;
 	storage->rpmb = calloc(1, sizeof(*storage->rpmb));
 	assert(storage->rpmb);
 	storage->rpmb->fd = -1;
 	for (size_t i = 0; i < LISTENER_COUNT; ++i) {
 		struct storage_listener *listener = &storage->listeners[i];
 		listener->storage = storage;
+		listener->service = i == 2 ? RPMB_SERVICE_ID :
+			(i ? FILE_SERVICE_ID : GPFILE_SERVICE_ID);
 		listener->size = RPMB_BUFFER_BYTES;
 		listener->shared = malloc(listener->size);
 		listener->work = malloc(listener->size);
@@ -514,10 +565,77 @@ static void listener_lifetime(int directory)
 		listener->memory = (Object){memory_release, &releases[i]};
 		Object callback = {storage_invoke, listener};
 		Object_retain(callback);
+		/* Model secure-world callback references arriving after listener
+		 * deregistration. Shared memory must outlive those references.
+		 */
+		Object_retain(callback);
 	}
-	goodix_storage_close(storage);
-	assert(registrations == LISTENER_COUNT && memories == LISTENER_COUNT);
+	goodix_storage_allow_rpmb(storage, 1);
+
+	/* Pause an actual GPFS write inside its real fsync. Shutdown must wait
+	 * for the callback's mutex before closing the directory used by rename.
+	 */
+	assert(!sem_init(&callback_in_fsync, 0, 0) && !sem_init(&callback_continue, 0, 0));
+	assert(!sem_init(&close_started, 0, 0) && !sem_init(&close_finished, 0, 0));
+	struct storage_listener *gpfs = &storage->listeners[0];
+	tz_gpfile_write_req_t *write = gpfs->shared;
+	memset(write, 0, gpfs->size);
+	write->cmd_id = (tz_gpfs_msg_cmd_type)GPFS_WRITE;
+	path(write->pathname, "inflight");
+	write->count = 4;
+	memcpy(write->buf, "data", 4);
+	atomic_store(&pause_fsync, 1);
+	pthread_t callback_thread, close_thread;
+	assert(!pthread_create(&callback_thread, NULL, pending_file_write, gpfs));
+	assert(!sem_wait(&callback_in_fsync));
+	assert(!pthread_create(&close_thread, NULL, close_storage, storage));
+	assert(!sem_wait(&close_started));
+	struct timespec deadline;
+	assert(!clock_gettime(CLOCK_REALTIME, &deadline));
+	deadline.tv_nsec += 50000000;
+	if (deadline.tv_nsec >= 1000000000) {
+		deadline.tv_nsec -= 1000000000;
+		deadline.tv_sec++;
+	}
+	int waited;
+	do {
+		waited = sem_timedwait(&close_finished, &deadline);
+	} while (waited && errno == EINTR);
+	assert(waited == -1 && errno == ETIMEDOUT);
+	assert(fcntl(owned_directory, F_GETFD) >= 0 && fcntl(owned_file, F_GETFD) >= 0);
+	assert(!storage->stopped && storage->allow_rpmb);
+	assert(!sem_post(&callback_continue));
+	assert(!pthread_join(callback_thread, NULL) && !pthread_join(close_thread, NULL));
+	assert(!sem_destroy(&callback_in_fsync) && !sem_destroy(&callback_continue));
+	assert(!sem_destroy(&close_started) && !sem_destroy(&close_finished));
+	assert(registrations == LISTENER_COUNT && !memories);
 	assert(fcntl(owned_directory, F_GETFD) == -1 && errno == EBADF);
+	assert(fcntl(owned_file, F_GETFD) == -1 && errno == EBADF);
+	assert(!storage->allow_rpmb && storage->rpmb && storage->directory == -1);
+
+	/* A new native session can claim the real directory lock even though
+	 * old CBO references still own all three listener buffers.
+	 */
+	int next = openat(directory, "listeners", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	assert(next >= 0 && !storage_claim_directory(next, 1));
+	expect_file(next, "inflight", "data", 4);
+	close(next);
+	for (size_t i = 0; i < LISTENER_COUNT; ++i) {
+		struct storage_listener *listener = &storage->listeners[i];
+		memset(listener->shared, 0xa5, listener->size);
+		uint32_t wide = UINT32_MAX;
+		ObjectArg args[6] = { [1].b = { &wide, sizeof(wide) } };
+		assert(storage_invoke(listener, 0, args,
+			ObjectCounts_pack(0, 2, 0, 4)) == Object_ERROR);
+		assert(wide == 0 && !args[0].b.size && !storage->rpmb_requests);
+		for (size_t j = 0; j < listener->size; ++j)
+			assert(((uint8_t *)listener->shared)[j] == 0xa5);
+	}
+	for (size_t i = 0; i < LISTENER_COUNT; ++i) {
+		Object callback = {storage_invoke, &storage->listeners[i]};
+		Object_release(callback);
+	}
+	assert(memories == LISTENER_COUNT);
 }
 
 int main(int argc, char **argv)
