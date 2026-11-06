@@ -69,6 +69,9 @@ class GoodixProfileTests(unittest.TestCase):
     def test_only_selected_linux_gatekeeper_create_verify_opens_rpmb_window(self):
         self.check_profile('gatekeeper-window')
 
+    def test_initialization_uses_policy_saved_before_init_overwrites_payload(self):
+        self.check_profile('initialization-policy')
+
 
 if __name__ == '__main__':
     unittest.main()

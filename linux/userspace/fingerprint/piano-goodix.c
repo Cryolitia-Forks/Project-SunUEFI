@@ -781,7 +781,10 @@ static int initialize_sensor(struct client *client, struct sensor_geometry *geom
 	if (result)
 		return result;
 	memset(client->shared, 0, client->shared_size);
-	/* Factory default interaction policy, without Android debug overrides. */
+	/* The factory's 1109 packet copies g_hal_config +0x19c, saved from
+	 * device-info +0x20c before INIT replaced the shared payload.
+	 */
+	((uint8_t *)client->shared)[0x6c] = geometry->interaction_policy;
 	return sensor_command(client, 1109, 0xc0);
 }
 
@@ -1760,10 +1763,12 @@ int piano_goodix_diagnostics(int argc, char **argv)
 		       "\"chip_type\":%u,\"max_templates\":%u,\"rows\":%u,\"columns\":%u,"
 		       "\"nav_rows\":%u,\"nav_columns\":%u,"
 		       "\"model_required\":%u,\"anti_spoof_required\":%u,"
+		       "\"interaction_policy\":%u,"
 		       "\"models_loaded\":%s,\"sensor_initialized\":true}\n",
 		       geometry.sensor_type, geometry.chip_type, geometry.max_templates, geometry.rows,
 		       geometry.columns, geometry.nav_rows, geometry.nav_columns,
 		       geometry.model_required, geometry.anti_spoof_required,
+		       geometry.interaction_policy,
 		       geometry.models_loaded ? "true" : "false");
 	else if (!result)
 		printf("{\"sensor\":\"Goodix\",\"sensor_type\":%u,"

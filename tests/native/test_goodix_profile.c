@@ -281,6 +281,79 @@ static void gatekeeper_window(void)
 	pthread_mutex_destroy(&fixture.storage.mutex);
 }
 
+/* These allocations are used only when uploading models. The packet test
+ * selects the actual no-model initialization path and must never reach them.
+ */
+int MinkCom_getMemoryObject(Object root, size_t size, Object *memory)
+{
+	(void)root; (void)size; (void)memory;
+	assert(0);
+	return Object_ERROR;
+}
+
+int MinkCom_getMemoryObjectInfo(Object memory, void **address, size_t *size)
+{
+	(void)memory; (void)address; (void)size;
+	assert(0);
+	return Object_ERROR;
+}
+
+struct initialization_fixture {
+	uint8_t payload[SHARED_SIZE];
+	unsigned int calls;
+	uint8_t policy;
+};
+
+static int32_t initialization_command(ObjectCxt context, ObjectOp operation,
+				      ObjectArg *args, ObjectCounts counts)
+{
+	struct initialization_fixture *fixture = context;
+	const struct goodix_request *request = args[0].bi.ptr;
+	const uint32_t commands[] = {1001, 1005, 1109};
+	const size_t sizes[] = {0x168, 0x74, 0xc0};
+
+	assert(operation == 0 && counts == ObjectCounts_pack(4, 2, 4, 0));
+	assert(fixture->calls < sizeof(commands) / sizeof(commands[0]));
+	assert(request->command == commands[fixture->calls] && request->route == 1);
+	assert(request->payload_size == sizes[fixture->calls]);
+	if (request->command == 1001) {
+		/* INIT replaces the old device-info buffer, including its policy. */
+		memset(fixture->payload, 0, sizeof(fixture->payload));
+		fixture->payload[0x20c] = fixture->policy ^ 0xff;
+		uint32_t rows = 112, columns = 88;
+		memcpy(fixture->payload + 0x70, &rows, sizeof(rows));
+		memcpy(fixture->payload + 0x74, &columns, sizeof(columns));
+	} else if (request->command == 1109) {
+		assert(fixture->payload[0x6c] == fixture->policy);
+		assert(!fixture->payload[0x20c]);
+		for (size_t i = 0x6d; i < request->payload_size; ++i)
+			assert(!fixture->payload[i]);
+	}
+	memset(args[5].b.ptr, 0, args[5].b.size);
+	fixture->calls++;
+	return Object_OK;
+}
+
+static void initialization_policy(void)
+{
+	const uint8_t policies[] = {0, 0x5a};
+
+	for (size_t i = 0; i < sizeof(policies); ++i) {
+		struct initialization_fixture fixture = {.policy = policies[i]};
+		struct client client = {
+			.app = {initialization_command, &fixture},
+			.shared = fixture.payload, .shared_size = sizeof(fixture.payload),
+			.architecture = 2,
+		};
+		struct sensor_geometry geometry = {.sensor_type = 5};
+		fixture.payload[0x20c] = fixture.policy;
+		assert(!initialize_sensor(&client, &geometry));
+		assert(fixture.calls == 3 && client.sensor_started);
+		assert(geometry.rows == 112 && geometry.columns == 88);
+		assert(geometry.interaction_policy == fixture.policy);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	assert(argc == 3);
@@ -293,6 +366,7 @@ int main(int argc, char **argv)
 	else if (!strcmp(argv[1], "initialization-failure")) initialization_failure(directory);
 	else if (!strcmp(argv[1], "cancellation")) cancellation();
 	else if (!strcmp(argv[1], "gatekeeper-window")) gatekeeper_window();
+	else if (!strcmp(argv[1], "initialization-policy")) initialization_policy();
 	else assert(0);
 	close(directory);
 	return 0;
