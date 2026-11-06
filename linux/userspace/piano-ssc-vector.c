@@ -16,6 +16,7 @@ typedef struct {
     gint seconds;
     gint result;
     gboolean stopping;
+    gboolean probe;
     guint decoded;
 } Client;
 
@@ -58,10 +59,12 @@ watchdog (gpointer data)
     client->watchdog = 0;
     client->result = 2;
     if (!client->stopping) {
-        fprintf (stderr, "initialization/open timed out; cancelling and closing\n");
+        fprintf (stderr, "%s\n", client->probe ? "metadata discovery timed out; cancelling" :
+                 "initialization/open timed out; cancelling and closing");
         stop (client);
     } else {
-        fprintf (stderr, "cancellation/close timed out; sensor close is unconfirmed\n");
+        fprintf (stderr, "%s\n", client->probe ? "metadata cancellation timed out" :
+                 "cancellation/close timed out; sensor close is unconfirmed");
         g_cancellable_cancel (client->cancellable);
         g_main_loop_quit (client->loop);
     }
@@ -164,16 +167,41 @@ created (GObject *object, GAsyncResult *result, gpointer data)
     ssc_sensor_open (client->sensor, client->cancellable, opened, client);
 }
 
+static void
+discovered (GObject *object, GAsyncResult *result, gpointer data)
+{
+    Client *client = data;
+    g_autoptr (GError) error = NULL;
+    g_autoptr (GVariant) sensors = ssc_sensor_discover_finish (result, &error);
+
+    if (!sensors) {
+        client->result = 2;
+        fprintf (stderr, "metadata discovery failed: %s\n", error->message);
+    } else {
+        printf ("discovered=%" G_GSIZE_FORMAT "\n", g_variant_n_children (sensors));
+        for (gsize i = 0; i < g_variant_n_children (sensors); i++) {
+            g_autoptr (GVariant) sensor = g_variant_get_child_value (sensors, i);
+            g_autofree gchar *printed = g_variant_print (sensor, TRUE);
+
+            puts (printed);
+        }
+    }
+    g_main_loop_quit (client->loop);
+}
+
 int
 main (int argc, char **argv)
 {
     g_autofree gchar *sensor = NULL;
     g_autofree gchar *hex = NULL;
     gint decode = 0, seconds = 3;
+    gboolean probe = FALSE, all = FALSE;
     g_autoptr (GError) error = NULL;
-    g_autoptr (GOptionContext) options = g_option_context_new ("- original SSC vector fields, unknown units");
+    g_autoptr (GOptionContext) options = g_option_context_new ("- SSC metadata and original report bytes");
     GOptionEntry entries[] = {
-        {"sensor", 0, 0, G_OPTION_ARG_STRING, &sensor, "Subscribe to the exact public SSC data type", "TYPE"},
+        {"sensor", 0, 0, G_OPTION_ARG_STRING, &sensor, "Exact SSC data type to discover or subscribe", "TYPE"},
+        {"probe", 0, 0, G_OPTION_ARG_NONE, &probe, "Discover UIDs and complete attributes without enabling reports", NULL},
+        {"all", 0, 0, G_OPTION_ARG_NONE, &all, "With --probe, discover all instances instead of the default", NULL},
         {"seconds", 0, 0, G_OPTION_ARG_INT, &seconds, "Read for 1..30 seconds after open completes", "N"},
         {"decode", 0, 0, G_OPTION_ARG_INT, &decode, "Offline decode of original SSC event message ID", "ID"},
         {"payload-hex", 0, 0, G_OPTION_ARG_STRING, &hex, "Offline original protobuf payload", "HEX"},
@@ -190,7 +218,7 @@ main (int argc, char **argv)
         g_autoptr (GBytes) payload = NULL;
         gsize chars = strlen (hex);
 
-        if (sensor || decode <= 0 || chars == 0 || chars % 2 || chars > 131072)
+        if (sensor || probe || all || decode <= 0 || chars == 0 || chars % 2 || chars > 131072)
             return 2;
         bytes = g_malloc (chars / 2);
         for (gsize i = 0; i < chars; i += 2) {
@@ -202,15 +230,20 @@ main (int argc, char **argv)
         payload = g_bytes_new (bytes, chars / 2);
         return print_report (decode, payload) ? 0 : 2;
     }
-    if (!sensor || decode != 0 || seconds < 1 || seconds > 30)
+    if (!sensor || !*sensor || decode != 0 || seconds < 1 || seconds > 30 || (all && !probe)) {
+        fprintf (stderr, "Use --sensor TYPE with --probe [--all] or --seconds 1..30\n");
         return 2;
+    }
     Client client = {.loop = g_main_loop_new (NULL, FALSE),
-                     .cancellable = g_cancellable_new (), .seconds = seconds};
+                     .cancellable = g_cancellable_new (), .seconds = seconds, .probe = probe};
     guint interrupt_id = g_unix_signal_add (SIGINT, signal_stop, &client);
     guint terminate_id = g_unix_signal_add (SIGTERM, signal_stop, &client);
 
     client.watchdog = g_timeout_add_seconds (10, watchdog, &client);
-    ssc_sensor_new (sensor, client.cancellable, created, &client);
+    if (probe)
+        ssc_sensor_discover (sensor, !all, client.cancellable, discovered, &client);
+    else
+        ssc_sensor_new (sensor, client.cancellable, created, &client);
     g_main_loop_run (client.loop);
     if (client.watchdog)
         g_source_remove (client.watchdog);

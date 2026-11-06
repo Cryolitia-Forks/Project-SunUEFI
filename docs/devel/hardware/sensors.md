@@ -20,7 +20,7 @@
 | --- | --- |
 | `piano-sensors` | 上游 CI 为 `5`，本地补丁构建为 `5+sunuefi1`，架构 `all` |
 | `fastrpc-support`、`libfastrpc1` | `1.0.7-2~bpo13+1`，架构 `arm64` |
-| `libssc2`、`libssc-bin` | `0.4.4-2+piano1+sunuefi2`，架构 `arm64` |
+| `libssc2`、`libssc-bin` | `0.4.4-2+piano1+sunuefi3`，架构 `arm64` |
 | `iio-sensor-proxy` | `3.9-1+piano1`，架构 `arm64` |
 
 FastRPC 包使用上游脚本固定校验值的 Debian 二进制包；libssc 与 iio-sensor-proxy 从固定 `.dsc` 校验值的 Debian 源包重建。版本与六包集合会记录到发布 manifest。
