@@ -3,7 +3,7 @@
   "patches": [
     {
       "file": "0001-piano-goodix-uio.patch",
-      "sha256": "36b7b46c8d5375972e0bb4139bec3d9becb35ab66c32fd2bedfbb90b5e283305"
+      "sha256": "a3766e14211505490c126809e3c39ccaf4b8348c1c179cc6c31516ea56c7b556"
     }
   ]
 }

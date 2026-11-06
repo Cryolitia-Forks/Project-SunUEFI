@@ -181,7 +181,7 @@ diff --git a/libfprint/drivers/piano-goodix.c b/libfprint/drivers/piano-goodix.c
 new file mode 100644
 --- /dev/null
 +++ b/libfprint/drivers/piano-goodix.c
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,519 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/* Piano's Goodix reader is controlled by a named UIO device and the signed
 + * QTEE application. The native library owns its real hardware transactions;
@@ -495,7 +495,7 @@ new file mode 100644
 +{
 +  if (result == -ECANCELED)
 +    return g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED, "Fingerprint operation cancelled");
-+  if (result == -EAGAIN || result == -ETIMEDOUT)
++  if (result == -ETIMEDOUT)
 +    return fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
 +  if (result == -ENOENT || result == -ENODATA)
 +    return fpi_device_error_new (FP_DEVICE_ERROR_DATA_NOT_FOUND);
@@ -503,7 +503,10 @@ new file mode 100644
 +    return fpi_device_error_new (FP_DEVICE_ERROR_DATA_DUPLICATE);
 +  if (result == -ENOSPC)
 +    return fpi_device_error_new (FP_DEVICE_ERROR_DATA_FULL);
-+  if (result == -EBUSY)
++  /* EAGAIN is temporary storage or Gatekeeper unavailability, not a bad
++   * acquisition. Reporting a scan retry would make fprintd loop immediately.
++   */
++  if (result == -EBUSY || result == -EAGAIN)
 +    return fpi_device_error_new (FP_DEVICE_ERROR_BUSY);
 +  if (result == -ENODEV)
 +    return fpi_device_error_new (FP_DEVICE_ERROR_REMOVED);
@@ -720,7 +723,7 @@ diff --git a/tests/test-piano-goodix.c b/tests/test-piano-goodix.c
 new file mode 100644
 --- /dev/null
 +++ b/tests/test-piano-goodix.c
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,405 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/* Exercise the actual FpDevice bridge and GLib dispatch. Native transaction
 + * boundaries are replaced here; no test opens a UIO device or QTEE session.
@@ -735,7 +738,7 @@ new file mode 100644
 +
 +typedef enum {
 +  MATCH, NO_MATCH, RETRY_MATCH, RETRY_NO_MATCH, RETRY_FAILURE, RETRY_CANCEL,
-+  TIMEOUT, CANCEL_SCAN, ENROLL, ENROLL_FAILURE
++  TIMEOUT, BUSY, CANCEL_SCAN, ENROLL, ENROLL_FAILURE, ENROLL_BUSY
 +} Scenario;
 +static Scenario scenario;
 +static GThread *main_thread;
@@ -756,6 +759,11 @@ new file mode 100644
 +  assert_worker ();
 +  g_assert_cmpuint (uid, ==, getuid ());
 +  g_assert_cmpuint (finger, ==, FP_FINGER_LEFT_THUMB);
++  if (scenario == ENROLL_BUSY)
++    {
++      cleaned = TRUE;
++      return -EAGAIN;
++    }
 +  options->progress (PIANO_GOODIX_ENROLL_PROGRESS, 3, options->context);
 +  options->progress (PIANO_GOODIX_RETRY, 0, options->context);
 +  g_assert_false (options->should_cancel (options->context));
@@ -781,6 +789,11 @@ new file mode 100644
 +  assert_worker ();
 +  g_assert_cmpuint (uid, ==, getuid ());
 +  g_assert_cmpuint (finger, ==, FP_FINGER_LEFT_THUMB);
++  if (scenario == BUSY)
++    {
++      cleaned = TRUE;
++      return -EAGAIN;
++    }
 +  options->progress (PIANO_GOODIX_FINGER_DOWN, 0, options->context);
 +  if (scenario == RETRY_MATCH || scenario == RETRY_NO_MATCH ||
 +      scenario == RETRY_FAILURE || scenario == RETRY_CANCEL)
@@ -931,15 +944,22 @@ new file mode 100644
 +
 +  g_assert_true (cleaned);
 +  g_assert_cmpuint (calls, ==, 1);
-+  g_assert_cmpuint (retries, ==, 1);
-+  if (scenario == ENROLL_FAILURE)
++  if (scenario == ENROLL_BUSY)
 +    {
++      g_assert_null (result);
++      g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_BUSY);
++      g_assert_cmpuint (progress_count, ==, 0);
++    }
++  else if (scenario == ENROLL_FAILURE)
++    {
++      g_assert_cmpuint (retries, ==, 1);
 +      g_assert_null (result);
 +      g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL);
 +      g_assert_cmpuint (last_stage, <, 4);
 +    }
 +  else
 +    {
++      g_assert_cmpuint (retries, ==, 1);
 +      g_assert_no_error (error);
 +      g_assert_nonnull (result);
 +      g_assert_true (fp_print_get_device_stored (result));
@@ -1000,6 +1020,11 @@ new file mode 100644
 +      else if (scenario == RETRY_FAILURE)
 +        {
 +          g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL);
++          g_assert_cmpuint (verify_reports, ==, 0);
++        }
++      else if (scenario == BUSY)
++        {
++          g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_BUSY);
 +          g_assert_cmpuint (verify_reports, ==, 0);
 +        }
 +      else
@@ -1087,6 +1112,7 @@ new file mode 100644
 +  main_thread = g_thread_self ();
 +  g_test_add_data_func ("/piano-goodix/enroll/progress", GINT_TO_POINTER (ENROLL), test_enroll);
 +  g_test_add_data_func ("/piano-goodix/enroll/save-failure", GINT_TO_POINTER (ENROLL_FAILURE), test_enroll);
++  g_test_add_data_func ("/piano-goodix/enroll/busy", GINT_TO_POINTER (ENROLL_BUSY), test_enroll);
 +  g_test_add_data_func ("/piano-goodix/verify/match", GINT_TO_POINTER (MATCH), test_verify);
 +  g_test_add_data_func ("/piano-goodix/verify/not-match", GINT_TO_POINTER (NO_MATCH), test_verify);
 +  g_test_add_data_func ("/piano-goodix/verify/retry-then-match", GINT_TO_POINTER (RETRY_MATCH), test_verify);
@@ -1094,6 +1120,7 @@ new file mode 100644
 +  g_test_add_data_func ("/piano-goodix/verify/retry-then-failure", GINT_TO_POINTER (RETRY_FAILURE), test_verify);
 +  g_test_add_data_func ("/piano-goodix/verify/retry-then-cancel", GINT_TO_POINTER (RETRY_CANCEL), test_verify);
 +  g_test_add_data_func ("/piano-goodix/verify/timeout", GINT_TO_POINTER (TIMEOUT), test_verify);
++  g_test_add_data_func ("/piano-goodix/verify/busy", GINT_TO_POINTER (BUSY), test_verify);
 +  g_test_add_data_func ("/piano-goodix/verify/cancel-cleanup", GINT_TO_POINTER (CANCEL_SCAN), test_verify);
 +  g_test_add_func ("/piano-goodix/verify/foreign-uid", test_invalid_coordinates);
 +  g_test_add_func ("/piano-goodix/capabilities", test_capabilities);
