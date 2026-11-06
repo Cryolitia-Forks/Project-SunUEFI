@@ -42,6 +42,12 @@ class GoodixEventsTests(unittest.TestCase):
     def test_failures_and_pending_retry_can_be_cancelled(self):
         self.check_exchange('errors')
 
+    def test_authorized_consumer_pauses_results_and_drains_extended_capture(self):
+        self.check_exchange('authorized')
+
+    def test_quality_retry_nomatch_and_fatal_statuses_are_distinct(self):
+        self.check_exchange('quality')
+
 
 if __name__ == '__main__':
     unittest.main()

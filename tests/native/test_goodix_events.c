@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../../linux/userspace/fingerprint/piano-goodix-events.h"
@@ -251,6 +252,175 @@ static void errors(void)
 	assert(exchange.cancel_count == 1);
 }
 
+struct enrollment_exchange {
+	uint8_t *buffer;
+	unsigned int calls;
+	int32_t second_status;
+};
+
+static int enrollment_command(void *context, uint32_t number, size_t bytes, int32_t *status)
+{
+	struct enrollment_exchange *exchange = context;
+	uint8_t *buffer = exchange->buffer;
+
+	assert(buffer[GOODIX_ENROLL_EVENT_BUFFER_BYTES] == 0x6d);
+	*status = 0;
+	if (number == 1009)
+		return 0;
+	assert(number == 1016);
+	++exchange->calls;
+	if (exchange->calls == 1) {
+		assert(bytes == GOODIX_EVENT_BUFFER_BYTES);
+		assert(word(buffer, 0x98) == 1);
+		memset(buffer + GOODIX_EVENT_BUFFER_BYTES, 0xa5,
+		       GOODIX_ENROLL_EVENT_BUFFER_BYTES - GOODIX_EVENT_BUFFER_BYTES);
+	} else {
+		assert(bytes == GOODIX_ENROLL_EVENT_BUFFER_BYTES);
+		assert(word(buffer, 0x98) == 2);
+		assert(word(buffer, 0xa4) == 0 && word(buffer, 0xd138) == 0);
+		for (size_t i = 0xd13c; i < GOODIX_ENROLL_EVENT_BUFFER_BYTES; ++i)
+			assert(buffer[i] == 0);
+	}
+	put_word(buffer, 0x70, 0); /* ENROLL. */
+	put_word(buffer, 0x6c, 0x82);
+	put_word(buffer, 0x98, exchange->calls == 3 ? 0 : 2);
+	if (exchange->calls == 2)
+		*status = exchange->second_status;
+	return 0;
+}
+
+static void classified_status(int32_t status, enum goodix_events_purpose purpose,
+			      uint32_t operation, uint32_t mask, int expected,
+			      enum goodix_event_outcome outcome)
+{
+	const struct reply reply = { .request_phase = 1, .mask = mask,
+		.operation = operation, .status = status };
+	struct exchange exchange = { .replies = &reply, .count = 1 };
+	struct goodix_events events = {
+		.command = command, .context = &exchange,
+		.buffer = exchange.buffer, .buffer_size = GOODIX_EVENT_BUFFER_BYTES,
+	};
+	struct goodix_sensor_event sample;
+
+	exchange.buffer[GOODIX_EVENT_BUFFER_BYTES] = 0x6d;
+	assert(!goodix_events_start(&events));
+	events.purpose = purpose;
+	assert(goodix_events_read(&events, &sample) == expected);
+	assert(sample.application_status == status && sample.outcome == outcome);
+	assert(events.state != GOODIX_EVENTS_RESULT); /* Nonzero is never success. */
+	if (expected < 0)
+		assert(events.state == GOODIX_EVENTS_FAILED);
+	assert(!goodix_events_cancel(&events));
+}
+
+static void quality(void)
+{
+	const int32_t recoverable[] = {1011, 1012, 1013, 1045, 1060, 1094, 1101, 1104, 1110, 1117};
+	const int32_t fatal[] = {1003, 1022, 1026, 1031, 1055, 1056, 1057, 1061, 1099,
+		1100, 1234, -EIO};
+
+	for (size_t i = 0; i < sizeof(recoverable) / sizeof(*recoverable); ++i) {
+		classified_status(recoverable[i], GOODIX_EVENTS_ENROLL, 0, 0x80, 0,
+			GOODIX_EVENT_QUALITY_RETRY);
+		classified_status(recoverable[i], GOODIX_EVENTS_AUTHENTICATE, 1, 0x80, 0,
+			GOODIX_EVENT_QUALITY_RETRY);
+		classified_status(recoverable[i], GOODIX_EVENTS_METADATA, 1, 0x80, -EREMOTEIO,
+			GOODIX_EVENT_ORDINARY);
+		classified_status(recoverable[i], GOODIX_EVENTS_AUTHENTICATE, 0, 0x80, -EREMOTEIO,
+			GOODIX_EVENT_ORDINARY);
+		classified_status(recoverable[i], GOODIX_EVENTS_ENROLL, 0, 2, -EREMOTEIO,
+			GOODIX_EVENT_ORDINARY);
+	}
+	for (size_t i = 0; i < sizeof(fatal) / sizeof(*fatal); ++i) {
+		classified_status(fatal[i], GOODIX_EVENTS_ENROLL, 0, 0x80, -EREMOTEIO,
+			GOODIX_EVENT_ORDINARY);
+		classified_status(fatal[i], GOODIX_EVENTS_AUTHENTICATE, 1, 0x80, -EREMOTEIO,
+			GOODIX_EVENT_ORDINARY);
+	}
+	for (int32_t status = 1006; status <= 1119; status += 113) {
+		classified_status(status, GOODIX_EVENTS_AUTHENTICATE, 1, 0x80, 0,
+			GOODIX_EVENT_NOT_MATCH);
+		classified_status(status, GOODIX_EVENTS_ENROLL, 0, 0x80, -EREMOTEIO,
+			GOODIX_EVENT_ORDINARY);
+		classified_status(status, GOODIX_EVENTS_METADATA, 1, 0x80, -EREMOTEIO,
+			GOODIX_EVENT_ORDINARY);
+	}
+	classified_status(1064, GOODIX_EVENTS_AUTHENTICATE, 1, 0x80, 1, GOODIX_EVENT_ORDINARY);
+	classified_status(1064, GOODIX_EVENTS_ENROLL, 1, 0x80, -EREMOTEIO, GOODIX_EVENT_ORDINARY);
+	classified_status(1064, GOODIX_EVENTS_AUTHENTICATE, 4, 0x80, -EREMOTEIO,
+		GOODIX_EVENT_ORDINARY);
+
+	/* A bad extended frame does not become a remaining=0 enrollment result;
+	 * retain the factory phase-2 exchange until a genuinely successful reply.
+	 */
+	struct enrollment_exchange exchange = {
+		.buffer = calloc(1, GOODIX_ENROLL_EVENT_BUFFER_BYTES + 1), .second_status = 1011,
+	};
+	assert(exchange.buffer);
+	exchange.buffer[GOODIX_ENROLL_EVENT_BUFFER_BYTES] = 0x6d;
+	struct goodix_events events = {
+		.command = enrollment_command, .context = &exchange,
+		.buffer = exchange.buffer, .buffer_size = GOODIX_ENROLL_EVENT_BUFFER_BYTES,
+	};
+	struct goodix_sensor_event sample;
+	assert(!goodix_events_start(&events));
+	events.purpose = GOODIX_EVENTS_ENROLL;
+	events.enrollment_extended = 1;
+	assert(!goodix_events_read(&events, &sample) && events.state == GOODIX_EVENTS_RESULT);
+	assert(goodix_events_resume(&events) == 1);
+	assert(goodix_events_read(&events, &sample) == 1);
+	assert(sample.outcome == GOODIX_EVENT_QUALITY_RETRY && events.state == GOODIX_EVENTS_DRAIN);
+	assert(!goodix_events_read(&events, &sample) && events.state == GOODIX_EVENTS_RESULT);
+	assert(sample.outcome == GOODIX_EVENT_ORDINARY);
+	assert(!goodix_events_cancel(&events));
+	free(exchange.buffer);
+}
+
+static void authorized(void)
+{
+	const struct reply reply = { .request_phase = 1, .mask = 0x80, .operation = 1 };
+	struct exchange exchange = { .replies = &reply, .count = 1 };
+	struct goodix_events events = {
+		.command = command, .context = &exchange,
+		.buffer = exchange.buffer, .buffer_size = GOODIX_EVENT_BUFFER_BYTES,
+	};
+	struct goodix_sensor_event sample;
+
+	exchange.buffer[GOODIX_EVENT_BUFFER_BYTES] = 0x6d;
+	assert(goodix_events_start(&events) == 0);
+	events.purpose = GOODIX_EVENTS_AUTHENTICATE;
+	assert(goodix_events_read(&events, &sample) == 0);
+	assert(events.state == GOODIX_EVENTS_RESULT);
+	assert(goodix_events_read(&events, &sample) == -EINVAL);
+	assert(goodix_events_resume(&events) == 0);
+	assert(events.state == GOODIX_EVENTS_WAIT_IRQ);
+	assert(goodix_events_cancel(&events) == 0);
+	assert(events.purpose == GOODIX_EVENTS_METADATA);
+
+	struct enrollment_exchange enrollment = {
+		.buffer = calloc(1, GOODIX_ENROLL_EVENT_BUFFER_BYTES + 1),
+	};
+
+	assert(enrollment.buffer);
+	enrollment.buffer[GOODIX_ENROLL_EVENT_BUFFER_BYTES] = 0x6d;
+	struct goodix_events enrolling = {
+		.command = enrollment_command, .context = &enrollment,
+		.buffer = enrollment.buffer, .buffer_size = GOODIX_ENROLL_EVENT_BUFFER_BYTES,
+	};
+
+	assert(goodix_events_start(&enrolling) == 0);
+	enrolling.purpose = GOODIX_EVENTS_ENROLL;
+	enrolling.enrollment_extended = 1;
+	for (unsigned int i = 0; i < 3; ++i) {
+		assert(goodix_events_read(&enrolling, &sample) == 0);
+		assert(enrolling.state == GOODIX_EVENTS_RESULT);
+		assert(goodix_events_resume(&enrolling) == (i != 2));
+	}
+	assert(enrollment.calls == 3);
+	assert(goodix_events_cancel(&enrolling) == 0);
+	free(enrollment.buffer);
+}
+
 int main(int argc, char **argv)
 {
 	assert(argc == 2);
@@ -260,6 +430,10 @@ int main(int argc, char **argv)
 		retry();
 	else if (!strcmp(argv[1], "navigation"))
 		navigation();
+	else if (!strcmp(argv[1], "authorized"))
+		authorized();
+	else if (!strcmp(argv[1], "quality"))
+		quality();
 	else {
 		assert(!strcmp(argv[1], "errors"));
 		errors();

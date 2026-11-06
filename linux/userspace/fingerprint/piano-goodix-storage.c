@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-/* Restricted FS/GPFS diagnostic services using Qualcomm's public packed messages.
+/* Restricted FS/GPFS services using Qualcomm's public packed messages.
  * CRegisterListenerCBO and IListenerCBO operations follow minkipc's IDLs.
  * Requests carry no TA identity. Only the explicit directory is accessible.
  */
@@ -17,16 +17,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "MinkCom.h"
 #include "fs_msg.h"
 #include "gpfs_msg.h"
+#include "piano-goodix-rpmb.h"
 #include "piano-goodix-storage.h"
 
 /* The factory TA uses legacy IDs 0..3 with the public GPFS message layout. */
 enum { GPFS_READ, GPFS_WRITE, GPFS_REMOVE, GPFS_RENAME };
+enum { RPMB_SERVICE_ID = 0x2000, RPMB_BUFFER_BYTES = 20040, LISTENER_COUNT = 3 };
+enum storage_mode { STORAGE_EMPTY, STORAGE_PROFILE, STORAGE_ENROLL,
+	STORAGE_RPMB_DENY, STORAGE_RPMB_UFS };
 
 _Static_assert(sizeof(tz_file_open_req_t) == 264 &&
 	       offsetof(tz_file_open_req_t, flags) == 260, "FS open request ABI");
@@ -45,11 +50,15 @@ struct storage_listener {
 struct goodix_storage {
 	atomic_uint references;
 	pthread_mutex_t mutex;
-	struct storage_listener listeners[2];
+	struct storage_listener listeners[LISTENER_COUNT];
 	struct { int fd, handle; } files[FOPEN_MAX];
 	int next_handle, file_error;
 	int directory;
+	int profile;
 	int stopped;
+	struct goodix_rpmb *rpmb;
+	int allow_rpmb;
+	unsigned int rpmb_requests;
 };
 
 static int storage_filename(const char path[TZ_CM_MAX_NAME_LEN], const char **name)
@@ -97,11 +106,156 @@ static int storage_file(struct goodix_storage *storage, const char *name, int fl
 		return -error;
 	}
 	if (!S_ISREG(st.st_mode) || st.st_nlink != 1 || st.st_uid != geteuid() ||
+	    (st.st_mode & 0077) ||
 	    st.st_size < 0 || st.st_size > TZ_GPFS_FILE_SIZE) {
 		close(fd);
 		return -EACCES;
 	}
 	return fd;
+}
+
+/* Publish a complete file only after its data is durable. All names are flat
+ * components in the locked private directory; never truncate an unchecked inode.
+ */
+static int storage_replace(struct goodix_storage *storage, const char *name,
+			   const void *data, size_t size)
+{
+	char temporary[64];
+	uint64_t random;
+	size_t done = 0;
+	int error = 0, fd = storage_file(storage, name, O_RDONLY);
+
+	if (fd >= 0)
+		close(fd);
+	else if (fd != -ENOENT)
+		return -fd;
+
+	while (done < sizeof(random)) {
+		ssize_t bytes = getrandom((uint8_t *)&random + done, sizeof(random) - done, 0);
+		if (bytes < 0 && errno == EINTR)
+			continue;
+		if (bytes <= 0)
+			return bytes < 0 ? errno : EIO;
+		done += bytes;
+	}
+	snprintf(temporary, sizeof(temporary), ".piano-write-%016llx",
+		 (unsigned long long)random);
+	fd = openat(storage->directory, temporary,
+		    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+	if (fd < 0)
+		return errno;
+
+	for (done = 0; done < size;) {
+		ssize_t bytes = write(fd, (const uint8_t *)data + done, size - done);
+		if (bytes < 0 && errno == EINTR)
+			continue;
+		if (bytes <= 0) {
+			error = bytes < 0 ? errno : EIO;
+			goto done;
+		}
+		done += bytes;
+	}
+	if (fsync(fd)) {
+		error = errno;
+		goto done;
+	}
+	if (renameat(storage->directory, temporary, storage->directory, name)) {
+		error = errno;
+		goto done;
+	}
+	if (fsync(storage->directory))
+		error = errno;
+done:
+	close(fd);
+	if (error)
+		unlinkat(storage->directory, temporary, 0);
+	return error;
+}
+
+/* GPFS writes update a range, not an entire file. Retain the old suffix and
+ * zero-fill a hole. A requested backup is committed before publishing new data.
+ */
+static int storage_write(struct goodix_storage *storage, const char *name,
+			 const void *data, size_t count, size_t offset, int backup)
+{
+	struct stat st;
+	size_t old_size = 0, new_size, done = 0;
+	uint8_t *contents;
+	int fd = storage_file(storage, name, O_RDONLY), error = 0;
+
+	if (fd >= 0) {
+		if (fstat(fd, &st)) {
+			error = errno;
+			close(fd);
+			return error;
+		}
+		old_size = st.st_size;
+	} else if (fd != -ENOENT) {
+		return -fd;
+	}
+	new_size = count && offset + count > old_size ? offset + count : old_size;
+	contents = calloc(new_size ? new_size : 1, 1);
+	if (!contents) {
+		if (fd >= 0)
+			close(fd);
+		return ENOMEM;
+	}
+	while (done < old_size) {
+		ssize_t bytes = pread(fd, contents + done, old_size - done, done);
+		if (bytes < 0 && errno == EINTR)
+			continue;
+		if (bytes <= 0) {
+			error = bytes < 0 ? errno : EIO;
+			break;
+		}
+		done += bytes;
+	}
+	if (fd >= 0)
+		close(fd);
+	if (!error && backup) {
+		char previous[TZ_CM_MAX_NAME_LEN + sizeof(".bak")];
+
+		snprintf(previous, sizeof(previous), "%s.bak", name);
+		error = storage_replace(storage, previous, contents, old_size);
+	}
+	if (!error) {
+		if (count)
+			memcpy(contents + offset, data, count);
+		error = storage_replace(storage, name, contents, new_size);
+	}
+	explicit_bzero(contents, new_size);
+	free(contents);
+	return error;
+}
+
+static int storage_remove(struct goodix_storage *storage, const char *name)
+{
+	int fd = storage_file(storage, name, O_RDONLY);
+
+	if (fd < 0)
+		return -fd;
+	close(fd);
+	if (unlinkat(storage->directory, name, 0) || fsync(storage->directory))
+		return errno;
+	return 0;
+}
+
+static int storage_rename(struct goodix_storage *storage, const char *from, const char *to)
+{
+	int fd = storage_file(storage, from, O_RDONLY);
+
+	if (fd < 0)
+		return -fd;
+	close(fd);
+	fd = storage_file(storage, to, O_RDONLY);
+	if (fd >= 0)
+		close(fd);
+	else if (fd != -ENOENT)
+		return -fd;
+	if (renameat(storage->directory, from, storage->directory, to) ||
+	    fsync(storage->directory))
+		return errno;
+	return 0;
 }
 
 /* FTS checks existence with plain open/close before asking GPFS to unseal data.
@@ -191,7 +345,7 @@ static int storage_dispatch(struct goodix_storage *storage, void *buffer, size_t
 	int error = EOPNOTSUPP, fd = -1;
 	size_t done = 0;
 
-	if (size < sizeof(*response) || size < sizeof(tz_gpfile_write_req_t))
+	if (size < sizeof(tz_gpfile_write_rsp_t))
 		return -EMSGSIZE;
 	memcpy(&command, buffer, sizeof(command));
 	if (command == TZ_GPFS_MSG_CMD_GPFS_VERSION) {
@@ -202,13 +356,17 @@ static int storage_dispatch(struct goodix_storage *storage, void *buffer, size_t
 		return 0;
 	}
 	if (command <= GPFS_RENAME) {
-		memcpy(&read_request, buffer, sizeof(read_request));
-		memcpy(pathname, read_request.pathname, sizeof(pathname));
+		if (size < sizeof(tz_gpfile_remove_req_t))
+			return -EMSGSIZE;
+		memcpy(pathname, (uint8_t *)buffer + sizeof(command), sizeof(pathname));
 		error = storage_filename(pathname, &name);
 		if (error)
 			goto reply;
 	}
 	if (command == GPFS_READ || command == GPFS_WRITE) {
+		if (size < sizeof(read_request))
+			return -EMSGSIZE;
+		memcpy(&read_request, buffer, sizeof(read_request));
 		offset = read_request.offset;
 		count = read_request.count;
 		if (offset < 0 || count > TZ_GPFS_FILE_SIZE ||
@@ -218,15 +376,21 @@ static int storage_dispatch(struct goodix_storage *storage, void *buffer, size_t
 		}
 		if (command == GPFS_WRITE) {
 			tz_gpfile_write_req_t *request = buffer;
+			if (size < offsetof(tz_gpfile_write_req_t, buf) ||
+			    count > size - offsetof(tz_gpfile_write_req_t, buf))
+				return -EMSGSIZE;
 			backup = request->backup;
-			/* Do not silently omit a requested backup in this empty-store probe. */
-			if (backup) {
+			if (backup && !storage->profile) {
 				error = EOPNOTSUPP;
 				goto reply;
 			}
+			error = storage_write(storage, name, request->buf, count, offset, backup);
+			done = error ? 0 : count;
+			goto reply;
 		}
-		fd = storage_file(storage, name, command == GPFS_READ ? O_RDONLY :
-				  O_RDWR | O_CREAT | O_SYNC);
+		if (count > size - offsetof(tz_gpfile_read_rsp_t, buf))
+			return -EMSGSIZE;
+		fd = storage_file(storage, name, O_RDONLY);
 		if (fd < 0) {
 			error = -fd;
 			goto reply;
@@ -234,27 +398,36 @@ static int storage_dispatch(struct goodix_storage *storage, void *buffer, size_t
 		error = 0;
 		while (done < count) {
 			ssize_t bytes;
-			if (command == GPFS_READ)
-				bytes = pread(fd, response->buf + done, count - done, offset + done);
-			else
-				bytes = pwrite(fd, ((tz_gpfile_write_req_t *)buffer)->buf + done,
-					       count - done, offset + done);
+			bytes = pread(fd, response->buf + done, count - done, offset + done);
 			if (bytes < 0 && errno == EINTR)
 				continue;
-			if (bytes < 0 || (!bytes && command == GPFS_WRITE)) {
-				error = bytes < 0 ? errno : EIO;
+			if (bytes < 0) {
+				error = errno;
 				break;
 			}
 			if (!bytes)
 				break;
 			done += bytes;
 		}
-		if (!error && command == GPFS_WRITE && (fsync(fd) || fsync(storage->directory)))
-			error = errno;
 		close(fd);
 	} else if (command == GPFS_REMOVE || command == GPFS_RENAME) {
-		/* Initialization may request cleanup. Diagnose it without deleting data. */
-		error = EROFS;
+		if (!storage->profile) {
+			/* The empty-store diagnostic never deletes or renames a file. */
+			error = EROFS;
+		} else if (command == GPFS_REMOVE) {
+			error = storage_remove(storage, name);
+		} else {
+			char destination[TZ_CM_MAX_NAME_LEN];
+			const char *to;
+
+			if (size < sizeof(tz_gpfile_rename_req_t))
+				return -EMSGSIZE;
+			memcpy(destination, ((tz_gpfile_rename_req_t *)buffer)->to,
+			       sizeof(destination));
+			error = storage_filename(destination, &to);
+			if (!error)
+				error = storage_rename(storage, name, to);
+		}
 	}
 reply:
 	fprintf(stderr, "GPFS command=%u path=", command);
@@ -266,6 +439,73 @@ reply:
 	response->cmd_id = command;
 	response->err = error;
 	response->num_bytes_read = error ? 0 : done;
+	return 0;
+}
+
+/* minkipc's librpmbservice/rpmb_service.h defines these packed u32 headers.
+ * Copy only the command's fixed header, never the following RPMB frames. The
+ * negative response prevents secure-world reads, writes and partition changes.
+ */
+static int storage_rpmb_deny_dispatch(void *buffer, size_t size)
+{
+	uint32_t request[6] = {0}, response[5] = {0};
+	size_t request_bytes, response_bytes;
+
+	if (size < sizeof(uint32_t))
+		return -EMSGSIZE;
+	memcpy(request, buffer, sizeof(uint32_t));
+	switch (request[0]) {
+	case 0x101:
+		request_bytes = 8;
+		response_bytes = 20;
+		break;
+	case 0x102:
+	case 0x103:
+		request_bytes = 24;
+		response_bytes = 20;
+		break;
+	case 0x104:
+		request_bytes = 12;
+		response_bytes = 16;
+		break;
+	default:
+		fprintf(stderr, "RPMB probe command=%#x unsupported; no I/O\n", request[0]);
+		return -EOPNOTSUPP;
+	}
+	if (size < request_bytes || size < response_bytes)
+		return -EMSGSIZE;
+	memcpy(request, buffer, request_bytes);
+	response[0] = request[0];
+	if (request[0] == 0x101) {
+		response[1] = request[1];
+		response[2] = (uint32_t)-EPERM;
+		fprintf(stderr, "RPMB probe command=%#x version=%#x denied; no I/O\n",
+			request[0], request[1]);
+	} else if (request[0] == 0x104) {
+		response[1] = (uint32_t)-EPERM;
+		response[3] = response_bytes;
+		fprintf(stderr, "RPMB probe command=%#x version=%#x device=%u denied; no I/O\n",
+			request[0], request[1], request[2]);
+	} else {
+		response[1] = (uint32_t)-EPERM;
+		response[3] = response_bytes;
+		response[4] = request[4];
+		fprintf(stderr, "RPMB probe command=%#x version=%#x sectors=%u bytes=%u "
+			"offset=%u batch=%u denied; no I/O\n", request[0], request[4],
+			request[1], request[2], request[3], request[5]);
+		if (request[3] >= request_bytes && request[3] <= size &&
+		    request[2] >= 512 && request[2] <= size - request[3]) {
+			const uint8_t *frame = (uint8_t *)buffer + request[3];
+			/* These three public structural fields are the only frame
+			 * bytes inspected. Data, MAC, nonce and counter remain opaque.
+			 */
+			fprintf(stderr, "RPMB probe frame type=%#x address=%u block_count=%u\n",
+				(unsigned int)frame[510] << 8 | frame[511],
+				(unsigned int)frame[504] << 8 | frame[505],
+				(unsigned int)frame[506] << 8 | frame[507]);
+		}
+	}
+	memcpy(buffer, response, response_bytes);
 	return 0;
 }
 
@@ -281,14 +521,20 @@ static int32_t storage_invoke(ObjectCxt context, ObjectOp operation,
 	}
 	if (operation == Object_OP_release) {
 		if (atomic_fetch_sub(&storage->references, 1) == 1) {
-			for (size_t i = 0; i < 2; i++) {
+			for (size_t i = 0; i < LISTENER_COUNT; i++) {
+				if (storage->listeners[i].shared)
+					explicit_bzero(storage->listeners[i].shared, storage->listeners[i].size);
 				Object_RELEASE_IF(storage->listeners[i].memory);
+				if (storage->listeners[i].work)
+					explicit_bzero(storage->listeners[i].work, storage->listeners[i].size);
 				free(storage->listeners[i].work);
 			}
 			for (size_t i = 0; i < FOPEN_MAX; i++)
 				if (storage->files[i].handle)
 					close(storage->files[i].fd);
-			close(storage->directory);
+			if (storage->directory >= 0)
+				close(storage->directory);
+			goodix_rpmb_close(storage->rpmb);
 			pthread_mutex_destroy(&storage->mutex);
 			free(storage);
 		}
@@ -311,11 +557,26 @@ static int32_t storage_invoke(ObjectCxt context, ObjectOp operation,
 		return Object_ERROR_BUSY;
 	int result = -ECANCELED;
 	if (!storage->stopped) {
-		memcpy(listener->work, listener->shared, listener->size);
-		result = listener->service == FILE_SERVICE_ID ?
-			storage_fs_dispatch(storage, listener->work, listener->size) :
-			storage_dispatch(storage, listener->work, listener->size);
-		memcpy(listener->shared, listener->work, listener->size);
+		if (listener->service == RPMB_SERVICE_ID) {
+			storage->rpmb_requests++;
+			if (storage->rpmb && storage->allow_rpmb) {
+				/* Secure world can change shared memory independently.
+				 * Bind frame validation and SG_IO to this one HLOS copy.
+				 */
+				memcpy(listener->work, listener->shared, listener->size);
+				result = goodix_rpmb_dispatch(storage->rpmb, listener->work, listener->size);
+				memcpy(listener->shared, listener->work, listener->size);
+				explicit_bzero(listener->work, listener->size);
+			} else {
+				result = storage_rpmb_deny_dispatch(listener->shared, listener->size);
+			}
+		} else {
+			memcpy(listener->work, listener->shared, listener->size);
+			result = listener->service == FILE_SERVICE_ID ?
+				storage_fs_dispatch(storage, listener->work, listener->size) :
+				storage_dispatch(storage, listener->work, listener->size);
+			memcpy(listener->shared, listener->work, listener->size);
+		}
 	}
 	pthread_mutex_unlock(&storage->mutex);
 	return result ? Object_ERROR : Object_OK;
@@ -361,51 +622,64 @@ failed:
 	return result;
 }
 
-int goodix_storage_open(const char *directory, struct goodix_storage **output)
+/* A directory lock covers the complete listener lifetime, including backups.
+ * A profile may reopen its files; the original diagnostic requires a fresh one.
+ */
+static int storage_claim_directory(int fd, int profile)
 {
-	struct goodix_storage *storage = NULL;
 	struct stat st;
-	Object root = Object_NULL, environment = Object_NULL;
-	DIR *entries = NULL;
-	int fd = -1, result = -EINVAL;
-	uint32_t uid = 87;
+	DIR *entries;
+	int error = 0, scan;
 
-	*output = NULL;
-	fd = storage_directory(directory);
-	if (fd < 0)
-		return fd;
-	if (fstat(fd, &st)) {
-		result = -errno;
-		goto done;
-	}
-	if (st.st_uid != geteuid() || (st.st_mode & 0777) != 0700) {
-		result = -EACCES;
-		goto done;
-	}
-	if (flock(fd, LOCK_EX | LOCK_NB)) {
-		result = -errno;
-		goto done;
-	}
-	int scan = dup(fd);
-	if (scan < 0) {
-		result = -errno;
-		goto done;
-	}
+	if (fstat(fd, &st))
+		return -errno;
+	if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0777) != 0700)
+		return -EACCES;
+	if (flock(fd, LOCK_EX | LOCK_NB))
+		return -errno;
+	if (profile)
+		return 0;
+	scan = dup(fd);
+	if (scan < 0)
+		return -errno;
 	entries = fdopendir(scan);
 	if (!entries) {
-		result = -errno;
+		error = errno;
 		close(scan);
-		goto done;
+		return -error;
 	}
 	errno = 0;
-	for (struct dirent *entry; (entry = readdir(entries));)
+	for (struct dirent *entry; (entry = readdir(entries));) {
 		if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
-			result = -ENOTEMPTY;
-			goto done;
+			error = ENOTEMPTY;
+			break;
 		}
-	if (errno) {
-		result = -errno;
-		goto done;
+	}
+	if (!error && errno)
+		error = errno;
+	closedir(entries);
+	return -error;
+}
+
+static int storage_open(const char *directory, enum storage_mode mode,
+			struct goodix_storage **output)
+{
+	struct goodix_storage *storage = NULL;
+	Object root = Object_NULL, environment = Object_NULL;
+	int fd = -1, result = -EINVAL;
+	uint32_t uid = 87;
+	int profile = mode == STORAGE_PROFILE || mode == STORAGE_ENROLL;
+	int only_rpmb = mode == STORAGE_RPMB_DENY || mode == STORAGE_RPMB_UFS;
+	int rpmb_backend = mode == STORAGE_ENROLL || mode == STORAGE_RPMB_UFS;
+
+	*output = NULL;
+	if (!only_rpmb) {
+		fd = storage_directory(directory);
+		if (fd < 0)
+			return fd;
+		result = storage_claim_directory(fd, profile);
+		if (result)
+			goto done;
 	}
 	storage = calloc(1, sizeof(*storage));
 	if (!storage) {
@@ -415,18 +689,31 @@ int goodix_storage_open(const char *directory, struct goodix_storage **output)
 	atomic_init(&storage->references, 1);
 	pthread_mutex_init(&storage->mutex, NULL);
 	storage->directory = fd;
+	storage->profile = profile;
 	fd = -1;
-	for (size_t i = 0; i < 2; i++)
+	for (size_t i = 0; i < LISTENER_COUNT; i++)
 		storage->listeners[i].storage = storage;
+	if (rpmb_backend) {
+		result = goodix_rpmb_open(&storage->rpmb);
+		if (result)
+			goto done;
+	}
 	if (MinkCom_getRootEnvObject(&root) ||
 	    MinkCom_getClientEnvObject(root, &environment)) {
 		result = -EIO;
 		goto done;
 	}
-	for (size_t i = 0; i < 2; i++) {
+	/* Enrollment owns all three listeners under one lock and lifetime. Other
+	 * profile operations only register FS/GPFS; the isolated diagnostic only
+	 * registers RPMB. A conflicting existing listener is never replaced.
+	 */
+	for (size_t i = only_rpmb ? 2 : 0;
+	     i < (only_rpmb || rpmb_backend ? 3U : 2U); i++) {
 		struct storage_listener *listener = &storage->listeners[i];
-		size_t bytes = i ? FILE_SERVICE_BUF_LEN : GPFILE_SERVICE_BUF_LEN;
-		listener->service = i ? FILE_SERVICE_ID : GPFILE_SERVICE_ID;
+		size_t bytes = i == 2 ? RPMB_BUFFER_BYTES :
+			(i ? FILE_SERVICE_BUF_LEN : GPFILE_SERVICE_BUF_LEN);
+		listener->service = i == 2 ? RPMB_SERVICE_ID :
+			(i ? FILE_SERVICE_ID : GPFILE_SERVICE_ID);
 		Object callback = {storage_invoke, (ObjectCxt)listener};
 		ObjectArg open[] = {{.bi = {&uid, sizeof(uid)}}, {.o = Object_NULL}};
 		if (Object_invoke(environment, 0, open, ObjectCounts_pack(1, 0, 0, 1))) {
@@ -440,10 +727,12 @@ int goodix_storage_open(const char *directory, struct goodix_storage **output)
 			result = -ENOMEM;
 			goto done;
 		}
-		listener->work = calloc(1, listener->size);
-		if (!listener->work) {
-			result = -ENOMEM;
-			goto done;
+		if (i != 2 || storage->rpmb) {
+			listener->work = calloc(1, listener->size);
+			if (!listener->work) {
+				result = -ENOMEM;
+				goto done;
+			}
 		}
 		ObjectArg register_args[] = {
 			{.bi = {&listener->service, sizeof(listener->service)}},
@@ -462,14 +751,48 @@ int goodix_storage_open(const char *directory, struct goodix_storage **output)
 	storage = NULL;
 	result = 0;
 done:
-	if (entries)
-		closedir(entries);
 	if (fd >= 0)
 		close(fd);
 	Object_RELEASE_IF(environment);
 	Object_RELEASE_IF(root);
 	goodix_storage_close(storage);
 	return result;
+}
+
+int goodix_storage_open(const char *directory, struct goodix_storage **output)
+{
+	return storage_open(directory, STORAGE_EMPTY, output);
+}
+
+int goodix_storage_open_profile(const char *directory, int gatekeeper,
+			       struct goodix_storage **output)
+{
+	return storage_open(directory, gatekeeper ? STORAGE_ENROLL : STORAGE_PROFILE, output);
+}
+
+int goodix_storage_open_rpmb_probe(struct goodix_storage **output)
+{
+	return storage_open(NULL, STORAGE_RPMB_DENY, output);
+}
+
+int goodix_storage_open_rpmb_ufs(struct goodix_storage **output)
+{
+	return storage_open(NULL, STORAGE_RPMB_UFS, output);
+}
+
+void goodix_storage_allow_rpmb(struct goodix_storage *storage, int allow)
+{
+	pthread_mutex_lock(&storage->mutex);
+	storage->allow_rpmb = !!allow;
+	pthread_mutex_unlock(&storage->mutex);
+}
+
+unsigned int goodix_storage_rpmb_probe_requests(struct goodix_storage *storage)
+{
+	pthread_mutex_lock(&storage->mutex);
+	unsigned int requests = storage->rpmb_requests;
+	pthread_mutex_unlock(&storage->mutex);
+	return requests;
 }
 
 void goodix_storage_close(struct goodix_storage *storage)
@@ -479,7 +802,7 @@ void goodix_storage_close(struct goodix_storage *storage)
 	pthread_mutex_lock(&storage->mutex);
 	storage->stopped = 1;
 	pthread_mutex_unlock(&storage->mutex);
-	for (size_t i = 0; i < 2; i++)
+	for (size_t i = 0; i < LISTENER_COUNT; i++)
 		Object_RELEASE_IF(storage->listeners[i].registration);
 	Object callback = {storage_invoke, (ObjectCxt)&storage->listeners[0]};
 	Object_release(callback);

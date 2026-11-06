@@ -6,19 +6,34 @@
 #include <stdint.h>
 
 #define GOODIX_EVENT_BUFFER_BYTES 0xd134U
+#define GOODIX_ENROLL_EVENT_BUFFER_BYTES 0x10e9e0U
 
 enum goodix_events_state {
 	GOODIX_EVENTS_IDLE,
 	GOODIX_EVENTS_WAIT_IRQ,
 	GOODIX_EVENTS_DRAIN,
 	GOODIX_EVENTS_RETRY,
+	GOODIX_EVENTS_RESULT,
 	GOODIX_EVENTS_FAILED,
+};
+
+enum goodix_events_purpose {
+	GOODIX_EVENTS_METADATA,
+	GOODIX_EVENTS_ENROLL,
+	GOODIX_EVENTS_AUTHENTICATE,
 };
 
 enum goodix_capture_state {
 	GOODIX_CAPTURE_NONE,
 	GOODIX_CAPTURE_PENDING,
 	GOODIX_CAPTURE_ADVANCED,
+	GOODIX_CAPTURE_EXTENDED,
+};
+
+enum goodix_event_outcome {
+	GOODIX_EVENT_ORDINARY,
+	GOODIX_EVENT_QUALITY_RETRY,
+	GOODIX_EVENT_NOT_MATCH,
 };
 
 /* Sensor metadata only. An interrupt or event mask is never a match result. */
@@ -27,6 +42,8 @@ struct goodix_sensor_event {
 	uint32_t operation;
 	uint32_t phase;
 	int32_t application_status;
+	/* A recoverable image condition is never a successful RESULT packet. */
+	enum goodix_event_outcome outcome;
 };
 
 /* The caller serializes commands and owns the shared buffer and IRQ fd.
@@ -40,7 +57,11 @@ struct goodix_events {
 	uint8_t *buffer;
 	size_t buffer_size;
 	enum goodix_events_state state;
+	enum goodix_events_state resume_state;
 	enum goodix_capture_state capture_state;
+	enum goodix_events_purpose purpose;
+	uint64_t enrollment_challenge;
+	int enrollment_extended;
 };
 
 int goodix_events_start(struct goodix_events *events);
@@ -58,6 +79,11 @@ int goodix_events_start(struct goodix_events *events);
  * Negative results require cancel/close, not a synthetic authentication result.
  */
 int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event *event);
+
+/* An explicit operation consumer must inspect a paused image result before
+ * continuing the handshake. Metadata watchers cannot enter RESULT state.
+ */
+int goodix_events_resume(struct goodix_events *events);
 int goodix_events_cancel(struct goodix_events *events);
 
 #endif

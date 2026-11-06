@@ -3,6 +3,7 @@
  * See docs/devel/hardware/led-ir-fingerprint.md for function addresses.
  */
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "piano-goodix-events.h"
@@ -26,6 +27,29 @@ static void write_word(uint8_t *buffer, size_t offset, uint32_t value)
 	memcpy(buffer + offset, &value, sizeof(value));
 }
 
+static int quality_retry(int32_t status)
+{
+	/* Factory err_table + result dispatcher 0x423fc: only these branches
+	 * issue acquired notifications and retain the running operation. HAT,
+	 * storage, CRC, unknown errors and broken-sensor counters are excluded.
+	 */
+	switch (status) {
+	case 1011: /* ACQUIRED_PARTIAL -> acquired 1 (0x4243c). */
+	case 1060: /* SENSOR_BROKEN_CHECK_ALGO_ERROR -> acquired 1. */
+	case 1012: /* ACQUIRED_IMAGER_DIRTY -> acquired 1060 (0x42424). */
+	case 1101: /* ALGO_DIRTY_FINGER -> acquired 1060. */
+	case 1104: /* ALGO_COVER_BROKEN -> acquired 1060. */
+	case 1013: /* DUPLICATE_FINGER -> acquired 1026 (0x42624). */
+	case 1045: /* DUPLICATE_AREA -> acquired 1025 (0x425b8). */
+	case 1094: /* TOO_FAST -> acquired 1058 / 5 (0x426cc). */
+	case 1110: /* ALGO_PALM_DETECT -> acquired 1028 (0x42690). */
+	case 1117: /* TOO_SLOW -> acquired 4 (0x42510). */
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 static int idle(struct goodix_events *events)
 {
 	int32_t status = 0;
@@ -36,6 +60,9 @@ static int idle(struct goodix_events *events)
 	if (!result && status)
 		result = -EREMOTEIO;
 	events->state = result ? GOODIX_EVENTS_FAILED : GOODIX_EVENTS_IDLE;
+	events->purpose = GOODIX_EVENTS_METADATA;
+	events->enrollment_extended = 0;
+	events->enrollment_challenge = 0;
 	return result;
 }
 
@@ -59,6 +86,8 @@ int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event 
 	int retry = events->state == GOODIX_EVENTS_RETRY;
 	int navigation = 0;
 	int can_begin_capture = events->state == GOODIX_EVENTS_WAIT_IRQ;
+	int extended = 0;
+	size_t packet_bytes = GOODIX_EVENT_BUFFER_BYTES;
 
 	if (events->state != GOODIX_EVENTS_WAIT_IRQ &&
 	    events->state != GOODIX_EVENTS_DRAIN && !retry)
@@ -80,8 +109,29 @@ int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event 
 		 */
 		write_word(events->buffer, 0x98, 2);
 		write_word(events->buffer, 0x9c, 0);
-	} else if (events->capture_state == GOODIX_CAPTURE_PENDING) {
-		events->capture_state = GOODIX_CAPTURE_ADVANCED;
+	} else if (events->capture_state == GOODIX_CAPTURE_PENDING ||
+		   events->capture_state == GOODIX_CAPTURE_EXTENDED) {
+		extended = events->purpose == GOODIX_EVENTS_ENROLL && events->enrollment_extended;
+		if (extended) {
+			if (events->buffer_size < GOODIX_ENROLL_EVENT_BUFFER_BYTES) {
+				events->state = GOODIX_EVENTS_FAILED;
+				return -EMSGSIZE;
+			}
+			/* HAL 0x417ac..0x418dc uses the same base packet, with this
+			 * extension reset before each enrollment capture exchange.
+			 */
+			if (events->capture_state == GOODIX_CAPTURE_PENDING)
+				memset(events->buffer + GOODIX_EVENT_BUFFER_BYTES, 0,
+				       GOODIX_ENROLL_EVENT_BUFFER_BYTES - GOODIX_EVENT_BUFFER_BYTES);
+			memset(events->buffer + 0xd13c, 0,
+			       GOODIX_ENROLL_EVENT_BUFFER_BYTES - 0xd13c);
+			write_word(events->buffer, 0xa4, 0);
+			write_word(events->buffer, 0xd138, 0); /* ENROLL operation. */
+			packet_bytes = GOODIX_ENROLL_EVENT_BUFFER_BYTES;
+			events->capture_state = GOODIX_CAPTURE_EXTENDED;
+		} else {
+			events->capture_state = GOODIX_CAPTURE_ADVANCED;
+		}
 	} else if (read_word(events->buffer, 0x98) == 8) {
 		navigation = 1;
 		/* HAL 0x4169c..0x416b8 consumes and clears the navigation result
@@ -95,7 +145,7 @@ int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event 
 		can_begin_capture = phase == 4 || phase == 5;
 	}
 	int result = events->command(events->context, 1016,
-				     GOODIX_EVENT_BUFFER_BYTES, &status);
+				     packet_bytes, &status);
 	if (result) {
 		events->state = GOODIX_EVENTS_FAILED;
 		return result;
@@ -121,13 +171,32 @@ int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event 
 	 * Enrollment is deliberately excluded: it may require an extended packet.
 	 */
 	if (status == GOODIX_MATCH_RETRY && event->operation >= 1 &&
-	    event->operation <= 4 && (retry || (event->mask & GOODIX_IMAGE_RESULT))) {
+	    event->operation <= 4 && (retry || (event->mask & GOODIX_IMAGE_RESULT)) &&
+	    (events->purpose == GOODIX_EVENTS_METADATA ||
+	     (events->purpose == GOODIX_EVENTS_AUTHENTICATE && event->operation <= 2))) {
 		events->state = GOODIX_EVENTS_RETRY;
 		return 1;
 	}
 	if (status) {
-		events->state = GOODIX_EVENTS_FAILED;
-		return -EREMOTEIO;
+		int enrollment = events->purpose == GOODIX_EVENTS_ENROLL && !event->operation;
+		int authentication = events->purpose == GOODIX_EVENTS_AUTHENTICATE &&
+			(event->operation == 1 || event->operation == 2);
+		/* The dispatcher is an image-result handler. A status from a
+		 * different operation or a packet without image bit 7 is not proof
+		 * that an authorized fingerprint attempt can recover from it.
+		 */
+		if ((event->mask & GOODIX_IMAGE_RESULT) && (enrollment || authentication) &&
+		    quality_retry(status))
+			event->outcome = GOODIX_EVENT_QUALITY_RETRY;
+		else if ((event->mask & GOODIX_IMAGE_RESULT) && authentication &&
+			 (status == 1006 || status == 1119))
+			/* Both jump to 0x42454 -> authenticate_not_match. */
+			event->outcome = GOODIX_EVENT_NOT_MATCH;
+		else {
+			fprintf(stderr, "Goodix command 1016 failed: application=%d\n", status);
+			events->state = GOODIX_EVENTS_FAILED;
+			return -EREMOTEIO;
+		}
 	}
 	/* HAL 0x42774..0x42834 completes image/FF authentication with UPDATE_CONFIG
 	 * (1109) and AUTHENTICATE_FINISH (1086). FIDO takes 0x424a0 -> 0x427cc and
@@ -136,7 +205,8 @@ int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event 
 	 * exposing group, template ID, HAT or FIDO result bytes.
 	 */
 	if ((event->mask & GOODIX_IMAGE_RESULT) &&
-	    (event->operation == 1 || event->operation == 2 || event->operation == 4)) {
+	    ((events->purpose != GOODIX_EVENTS_AUTHENTICATE &&
+	      (event->operation == 1 || event->operation == 2)) || event->operation == 4)) {
 		events->state = GOODIX_EVENTS_FAILED;
 		return -EOPNOTSUPP;
 	}
@@ -148,7 +218,8 @@ int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event 
 	 * Operation 0 may select the 0x10e9e0 enrollment packet at 0x41760.
 	 * NAV (6) and stable-factor testing (47) use different branches.
 	 */
-	if ((event->phase == 2 && (event->operation == 0 ||
+	if ((event->phase == 2 && ((event->operation == 0 &&
+				  events->purpose != GOODIX_EVENTS_ENROLL) ||
 				 event->operation == 6 || event->operation == 47)) ||
 	    (event->phase == 8 && event->operation != 6)) {
 		events->state = GOODIX_EVENTS_FAILED;
@@ -157,15 +228,33 @@ int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event 
 	/* New capture/navigation branches require finger-down bit 1 at HAL
 	 * 0x415e4/0x4164c. An ongoing navigation loop only tests its phase.
 	 */
+	if (extended && event->phase != 2)
+		events->capture_state = GOODIX_CAPTURE_ADVANCED;
 	if (events->capture_state == GOODIX_CAPTURE_PENDING ||
+	    (extended && event->phase == 2) ||
 	    event->phase == 4 || event->phase == 5 ||
 	    (event->phase == 8 && (navigation || (event->mask & GOODIX_FINGER_DOWN)))) {
 		events->state = GOODIX_EVENTS_DRAIN;
-		return 1;
+	} else {
+		events->state = GOODIX_EVENTS_WAIT_IRQ;
 	}
+	if (!status && (event->mask & GOODIX_IMAGE_RESULT) &&
+	    ((events->purpose == GOODIX_EVENTS_ENROLL && event->operation == 0) ||
+	     (events->purpose == GOODIX_EVENTS_AUTHENTICATE &&
+	      (event->operation == 1 || event->operation == 2)))) {
+		events->resume_state = events->state;
+		events->state = GOODIX_EVENTS_RESULT;
+		return 0;
+	}
+	return events->state == GOODIX_EVENTS_DRAIN;
+}
 
-	events->state = GOODIX_EVENTS_WAIT_IRQ;
-	return 0;
+int goodix_events_resume(struct goodix_events *events)
+{
+	if (events->state != GOODIX_EVENTS_RESULT)
+		return -EINVAL;
+	events->state = events->resume_state;
+	return events->state == GOODIX_EVENTS_DRAIN;
 }
 
 int goodix_events_cancel(struct goodix_events *events)

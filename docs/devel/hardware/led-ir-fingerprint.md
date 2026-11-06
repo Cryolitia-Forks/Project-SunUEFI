@@ -1,12 +1,12 @@
 # Piano 的 RGB 灯、红外与侧指纹
 
-本页记录 RGB 通道、SPI 红外和 Goodix 侧指纹的原厂接口与 Linux 实现。指纹客户端提供初始化和受限存储探测，桌面认证还需要 libfprint 后端。
+本页记录 RGB 通道、SPI 红外和 Goodix 侧指纹的原厂接口与 Linux 实现。原生指纹客户端已能持久录入和验证，标准 libfprint／fprintd 桌面链路正在接入。
 
 | 功能 | 原厂接口 | 当前 Linux 缺口 |
 | --- | --- | --- |
 | RGB 通道 | PM8550 SID1 上的 `qcom,pm8350c-pwm`，SPMI LPG，通道 1/2/3 为 red/green/blue | 标准驱动和产品DT已有；补齐SDAM/LPG模块加载后已出现三个标准LED接口。发光、可见位置和用途尚待确认。 |
 | 红外发射 | SE15 / SPI `0x89c000` / CS0，`ir-spi`，Android 原始波形字符设备 | 已接入标准 SPI/LIRC、原厂波形量化与 MOSI 空闲处理；光学输出未验证。 |
-| 侧指纹 | Goodix，GPIO 控制与高通 QTEE 安全服务 | 供电、复位、中断、初始化和受限 FS/GPFS 探测已接通；录入、认证和 fprintd 接入尚未完成。 |
+| 侧指纹 | Goodix，GPIO 控制与高通 QTEE 安全服务 | 原生录入、保存后重新打开验证及错误手指拒绝可用；标准 libfprint／fprintd 接入尚未完成。 |
 
 ## RGB 通道
 
@@ -60,6 +60,10 @@ GENI 驱动在消息开始时选择 default，在队列空闲且 SE 确认停止
 
 ## 侧指纹
 
+Linux 原生客户端已完成独立凭据创建、指纹录入、模板保存和重新打开后的验证。
+实机录入右食指后，关闭并重新打开客户端仍能匹配；未录入的左食指返回不匹配，
+不是等待超时。Linux 使用自己的凭据和模板目录，不复制 Android 已录入的指纹。
+
 HyperOS 4 的 `mfp-daemon` 使用 Goodix HAL、`/dev/xiaomi-fp`
 和高通 QTEE。`libQSEEComAPI.so` 通过 `libminkdescriptor.so` 打开
 UID 122 的 QSEECOMPAT 服务，再加载名为 **`gfpia`** 的签名安全程序。
@@ -90,7 +94,8 @@ Goodix 客户端使用 `QSEECom_send_modified_cmd()` 发送请求。
 [`piano-fingerprint.dtso`](../../../linux/dts/piano-fingerprint.dtso)。
 打开 `piano-goodix` UIO 设备时打开供电并释放复位，关闭时停止中断、
 拉低复位并归还电源引用；没有 MMIO 映射，也不把中断当成认证结果。
-Linux 已完成供电、复位和关闭。普通桌面应用的认证仍需 libfprint 后端。
+原生客户端完成操作后关闭传感器及安全程序。桌面接口范围见下文的
+[Gatekeeper 与桌面认证](#gatekeeper-与桌面认证)。
 
 原厂 `pm_humu_l9` 为 3.300 V。现有主线 PLDO 使用不同的离散电压档位；
 必须选择不超过原厂上限的 3.296 V。之前上取整到 3.304 V 时，
@@ -119,6 +124,21 @@ QSEECOMPAT 的 lookup 返回 `architecture=2`，命令应使用 64 位地址，
 [`config/fingerprint.json`](../../../config/fingerprint.json)。
 执行 `sudo piano-fingerprint-ctl info` 可查询设备信息，`--help` 不访问设备。
 签名程序按固件清单随镜像提供，不包含用户模板或密码。
+
+原生 API 位于 [`piano-goodix.h`](../../../linux/userspace/fingerprint/piano-goodix.h)，
+命令行与 libfprint 后端共用录入、验证、枚举和删除实现。以下以 Linux UID 1000
+和右食指为例；手指名称沿用 libfprint，也可用 1–10：
+
+```sh
+sudo piano-fingerprint-ctl enroll 1000 right-index-finger
+sudo piano-fingerprint-ctl verify 1000 right-index-finger
+sudo piano-fingerprint-ctl list 1000
+sudo piano-fingerprint-ctl delete 1000 right-index-finger
+```
+
+录入默认限时 120 秒，验证默认 30 秒，可在对应命令末尾指定秒数。Ctrl+C、
+SIGTERM 和 API 取消请求会先完成安全程序的取消与关闭，再返回；同步 QTEE 调用
+只能在返回后检查取消和时限。已保存的模板不会因随后收到取消而被回滚。
 
 `sudo piano-fingerprint-ctl initialize` 完成传感器初始化、原厂模型加载和
 交互策略设置，再正常关闭传感器。实机返回传感器类型 5、芯片类型 49、
@@ -157,8 +177,9 @@ QSEECOMPAT 的 lookup 返回 `architecture=2`，命令应使用 64 位地址，
 阶段 4、5，完成后才重新启用 IRQ。输出包括事件标志、中断计数、操作、阶段和
 应用状态，不保存或输出图像、模板 ID 和认证令牌。普通阶段 2 保留原包继续一次；
 导航阶段 8 清除已消费的导航区后继续，不生成键盘或认证事件。匹配重试状态 1064
-按原厂协议重新交换，每次调用只发送一条命令，供调用者检查取消和时限。需要扩展包的
-录入和特殊测试分支仍返回不支持。收到认证成功的安全程序响应时，诊断客户端也会取消，
+按原厂协议重新交换，每次调用只发送一条命令，供调用者检查取消和时限。
+`watch` 只观察事件；`enroll` 根据设备功能标志选择普通或扩展采集包。
+收到认证成功的安全程序响应时，诊断客户端也会取消，
 不代替真正认证客户端执行收尾或报告匹配成功。超时、Ctrl+C 和错误
 退出都先执行真实取消，再关闭安全程序及 UIO。这里的时限在每条同步 QTEE 命令
 返回后检查，不能中断一条尚未返回的安全调用。
@@ -169,18 +190,24 @@ QSEECOMPAT 的 lookup 返回 `architecture=2`，命令应使用 64 位地址，
 响应的 `+0x6c` 是事件位图、`+0x70` 是操作、`+0x98` 是处理阶段。
 `0x415a4–0x41610` 在阶段 4、5 保留原包再次调用 1016。阶段 2 的普通路径同样
 保留原包继续 1016；特定录入模式将包扩至 `0x10e9e0` 字节。阶段 8 在处理导航
-通知后清零 `+0x2f4` 起 `0x5a20` 字节，再继续交换。当前客户端已接入普通阶段 2 和导航交换，
-不选择未确认的扩展录入分支；静态调用链未发现必须运行 Android HAL 内专有匹配算法的环节。
-`+0x2c5` 是输出 HAT 中的大端 `authenticator_type`，数值表示指纹类型 2，
+通知后清零 `+0x2f4` 起 `0x5a20` 字节，再继续交换。原生状态机处理普通阶段 2、
+导航交换和设备要求的扩展录入包，匹配由原厂签名安全程序完成。
+`+0x2c5` 是输出硬件认证令牌（HAT）中的大端 `authenticator_type`，数值表示指纹类型 2，
 不是可替代录入授权的令牌。`libgf_ca.so:gf_ca_invoke_command`（`0x4170`）将
 64 字节响应中的第一个字作为应用状态返回，第二个字单独表示共享缓冲区错误；
 不能把所有非零应用状态都当成 QTEE 传输失败。
 
-`sudo piano-fingerprint-ctl list 1000` 创建 Linux 目录
-`/var/lib/piano-goodix/1000`，将分组 ID 和路径交给命令 1014，再通过 1015
-枚举模板。这个命令没有文件服务；传入 Linux 路径或返回空列表，都不能证明
-安全程序的 FTS 存储已经独立。最大模板数量取自设备信息，并按响应容量解析。
-标准 fprintd 用户元数据仍由后续的 libfprint 集成管理。
+每个 Linux 用户的数据放在 `/var/lib/piano-goodix/<uid>/`：
+
+```text
+gatekeeper/   独立随机凭据及安全程序返回的凭据句柄
+fpdata/       Goodix 安全程序密封的模板与算法文件
+profile       Linux UID、分组、安全用户 ID（SID）和手指名称到模板 ID 的映射
+```
+
+目录权限为 0700，文件为 0600，均由 root 管理。`list` 在命令 1014 选择该用户分组后，
+通过 1015 核对安全程序中的模板，只返回 Linux 元数据登记且仍存在的手指。
+保存中断时也只恢复已记录的待提交 ID，不收集或删除未知模板。
 
 `storage-probe --state-dir <empty-directory> <group>` 显式启动受限 FS/GPFS
 服务，初始化传感器并选择分组，随后关闭安全程序和服务。目录必须是新建的
@@ -189,10 +216,11 @@ Linux 空目录；服务将安全程序使用的虚拟路径映射到这里，�
 命令不复制模板、不录入、不认证，也不执行删除或重命名。
 
 文件服务位于 [`piano-goodix-storage.c`](../../../linux/userspace/fingerprint/piano-goodix-storage.c)。
-普通 FS 仅提供受限打开、关闭和错误状态，GPFS 处理初始化所需的文件请求；
-路径解析拒绝目录穿越、符号链接及外部文件描述符。空目录实机探测已完成
-初始化和组选择，并生成四份校准元数据；这不代表 Android 模板可直接用于认证，
-也不证明安全程序内部状态与 Android 已隔离。
+普通 FS 提供只读打开、关闭和错误状态；GPFS 提供读取、按偏移写入、备份、重命名和
+删除。安全程序的 `/data/vendor_de/0/fpdata/` 虚拟路径映射到所选 Linux 用户的
+`fpdata/`，拒绝目录穿越、符号链接、硬链接和外部文件描述符。写入保留未覆盖的数据，
+要求备份时先落盘同目录 `.bak`，再原子替换主文件并同步文件和目录。
+这些回调随原生操作建立和释放，不另加指纹守护进程。
 
 [`MinkIPC 补丁系列`](../../../patches/minkipc/0.1.0/series.json)修正回调输出缓冲区的
 重复释放与异常回收，并避免工作线程释放最后一个 root object 时自等待。
@@ -213,11 +241,10 @@ Goodix 的认证数据绑定。没有录入或认证操作，也不输出绑定�
 查询，会得到另一个错误。只有明确返回 `-10020` 时才初始化测试启动的
 sharing key，已有绑定可用时直接使用，避免重置其他客户端的有效会话。
 响应的偏移和长度均检查边界，临时参数和加密绑定数据在结束时清零。
-没有把密钥、令牌或指纹模板保存到普通文件。
+绑定临时参数与 HAT 不落盘；独立 Linux 凭据和密封模板按上述目录分别保存。
 
-上述 FS/GPFS 只在显式 `storage-probe` 进程内提供，不增加默认后台服务。
 原有[旧 GPFS 协议记录](../../../linux/bsp/patches/qtee/README.md)保留厂商接口说明；
-它不是 Linux 文件系统隔离或 RPMB 写入授权的依据。
+持久存储和 RPMB 实现由原生客户端管理。
 
 录入和认证的入口布局已由原厂 `libgf_hal.so` 静态确认，均使用路由 1：
 
@@ -228,19 +255,23 @@ sharing key，已有绑定可用时直接使用，避免重置其他客户端的
 | 结束录入 | `gf_hal_common_post_enroll`，`0x219b4`，1008／`0x6c` 字节 | 结束该次录入流程 |
 | 开始认证 | `gf_hal_common_authenticate`，`0x21a18`，1010／`0x80` 字节 | 分组 `+0x6c`，操作 ID `+0x70`，`+0x78=-1` |
 | 保存模板 | `gf_hal_save`，`0x20a74`，1012／`0x78` 字节 | 分组、模板 ID 位于 `+0x6c`、`+0x70` |
-| 删除模板 | `gf_hal_common_remove`，`0x21f34`，1013／`0xcc` 字节 | 分组、模板 ID 位于 `+0x6c`、`+0x70`；返回数量在 `+0xc8` |
+| 删除模板 | `gf_hal_common_remove`，`0x21f34`，1013／`0xcc` 字节 | 分组、模板 ID 位于 `+0x6c`、`+0x70`；`+0xc8` 为删除后的剩余总数 |
 
 成功结果由 Milan 结果分发函数 `0x42308` 判断：应用状态为零后，再区分操作。
 操作 1、2 的认证结果携带分组、模板 ID（`+0x80`、`+0x84`）及 HAT
 （`+0x2ac`，69 字节）；`0x42774` 将这些字段交给认证成功回调。
 `gf_hal_common_authenticate_success`（`0x248b4`）使用同样布局。录入操作 0
 则读取剩余次数 `+0x88`，归零后必须经 1012 保存，不能仅凭手指中断或
-进度归零报告录入成功。以上入口没有作为诊断客户端命令开放。
+进度归零报告录入成功。客户端在 1012 成功、Linux 手指映射落盘且完成 1008 后
+才返回录入成功。删除只使用该 UID 已登记的模板 ID，1013 成功后再用 1015 确认
+目标消失，最后更新 Linux 映射，不执行全局清空。
 
 匹配重试状态 1064（`GF_ERROR_MATCH_FAIL_AND_RETRY`）需要将 `+0x98` 的
 64 位值设为 2 并继续 1016。认证成功还需完成原厂的策略更新 1109，以及
 `GF_CMD_AUTHENTICATE_FINISH`（1086、`0x148` 字节）；后者不是可省略的日志命令。
-操作 4（FIDO 认证）的成功路径同样执行 1086，诊断客户端也不会将它当成已完成的中断。
+原生验证只有完成这两步才返回匹配成功，并核对分组、已登记模板 ID、SID 和挑战。
+未匹配返回 `-EACCES`，与采集质量重试、取消和超时分别处理。
+操作 4（FIDO 认证）的原厂路径同样执行 1086，但未作为本项目的认证入口。
 
 ### Gatekeeper 与桌面认证
 
@@ -255,10 +286,28 @@ sharing key，已有绑定可用时直接使用，避免重置其他客户端的
 | 建立独立凭据 | `0x21001` | `3`：UID，`8`：新凭据；更换时另带 `5`：旧 handle、`7`：旧凭据 |
 | 校验凭据 | `0x21002` | `3`：UID，`4`：挑战，`6`：handle，`9`：凭据 |
 
-录入授权需要用 Goodix 1006 返回的挑战执行真实 Gatekeeper 校验，再将其
+Linux 用 `0x40000000 | LinuxUID` 作为 Gatekeeper UID 和 Goodix 分组，
+接受的 Linux UID 范围为 `0`–`0x0fffffff`。凭据是客户端生成并持久保存的随机值，
+不是用户的登录口令；已完成的凭据直接复用，不重新创建或替换 SID。
+不读取或复制 Android 文件系统中的密码句柄和指纹模板，也不运行 Android gatekeeperd。
+
+录入用 Goodix 1006 返回的挑战执行 Gatekeeper 校验，再将其
 69 字节 HAT 原样交给 Goodix 1007。令牌中的类型和时间戳保留网络字节序，MAC
-必须为 32 字节；不能用 Linux 密码校验或自己生成的 HMAC 代替。现有 Keymaster
-绑定仅证明 Goodix 可得到认证数据，不代表 Gatekeeper 授权或独立用户隔离已完成。
+必须为 32 字节；不能用 Linux 密码校验或自行生成的 HMAC 代替。
+原厂 Keymaster 绑定、独立凭据创建、挑战校验和 Goodix 授权录入均已在实机完成。
+
+[`piano-goodix-rpmb.c`](../../../linux/userspace/fingerprint/piano-goodix-rpmb.c)
+通过 UFS BSG 的 `SG_IO` 提供回放保护存储（RPMB）通道。原厂读请求使用协议版本
+`0`，认证写请求使用 `0x100`；两者共用 24 字节请求头、512 字节帧和 20 字节响应头，
+响应保留请求版本。独立 Linux 凭据已通过该通道创建并持久保存。
+通道只转发计数器读取和认证读写，写后的结果查询由主机生成，拒绝密钥烧录、purge、配置写及
+未知版本／帧。写入或响应传输失败后停止该会话，不自动重试。
+
+录入期间，FS、GPFS 和 RPMB 三个回调由同一个对象管理。只有匹配所选高位 UID 的
+`0x21001` 创建或 `0x21002` 校验同步调用期间开放 RPMB；传感器初始化、挑战获取、
+采样、模板保存和关闭时均关闭。普通指纹验证、枚举和删除不打开 RPMB 后端。
+共享请求先复制到主机私有缓冲区，再校验和提交，回复后清零；日志只记录命令与
+帧结构状态，不输出数据、MAC、nonce、计数器、凭据或 HAT。
 
 对同机签名 `keymaster64` 的静态分析已确认 Gatekeeper 的记录管理：现代
 请求解析器拒绝超出 32 位的 UID，查找时比较完整 UID，不截断或取模。46 个记录槽
@@ -266,20 +315,23 @@ sharing key，已有绑定可用时直接使用，避免重置其他客户端的
 底层写回 512 字节扇区时会重算同扇区的 HMAC，不更改相邻记录的 UID、SID 或失败计数。
 共用的启动初始化会更新非零时间戳，不会清除失败计数。
 
-这些证据排除了该固件中 UID 别名和满表淘汰的风险，不代表 Goodix 模板、FTS 和
-SID 绑定已隔离。客户端仍不开放录入、删除或真实认证，也不运行带全局清理逻辑的
-Android gatekeeperd。当前 FS/GPFS 空目录探测同样不是可重新打开、备份和恢复模板的持久存储后端。
+RPMB 与 Android 共用，包含全局写计数器、启动记录和安全存储目录元数据。
+回调协议没有 TA 身份或 UID，主机不能按 Linux UID 过滤认证写，也不能从加密帧识别
+安全程序内部的全局目录更新。UID 隔离依赖上述原厂签名 Keymaster 的实现；
+命令白名单和短暂开放时段不等于独立的物理 RPMB。Linux 客户端不调用凭据删除或
+全局重置命令，Goodix 模板的普通文件则保存在独立的 Linux `fpdata/`。
 
 [标准 fprintd 录入接口](https://fprint.freedesktop.org/fprintd-dev/Device.html)
-只接收手指名称，由 Polkit 授权，不提供 Gatekeeper 密码或 HAT。后续后端需先建立
-Linux 独立凭据与模板存储，并将枚举、删除限制到这个命名空间，才能交给标准桌面服务。
+只接收手指名称，由 Polkit 授权，不提供 Gatekeeper 凭据或 HAT。
+[`libfprint 后端`](../../../patches/libfprint/1.94.100/0001-piano-goodix-uio.patch)
+直接链接同一原生 API，提供录入、单手指验证、枚举、按 UID 删除和取消；
+后端的设备私有数据只保存 Linux UID 和手指名称。fprintd 管理标准用户记录，
+密封模板仍由设备端存储管理。
+fprintd／GNOME 的端到端接入尚未完成，不能把原生命令行验证视为桌面解锁已可用。
 
-标准 libfprint 后端仍缺少三项实质功能：独立 Linux 凭据的合法 Gatekeeper/HAT
-签发；完整的 1016 采集、重试、结果和取消状态机；可恢复的独立模板存储、备份与
-删除事务。现有受限 FS/GPFS 只覆盖初始化，既没有按 TA 身份隔离回调，也未提供
-完整模板事务。Android 的[标准指纹会话接口](https://android.googlesource.com/platform/hardware/interfaces/+/b91c536488ae4de7782b0b8f1f6a9bba642692ad/biometrics/fingerprint/aidl/android/hardware/biometrics/fingerprint/ISession.aidl)
-要求录入使用真实 HAT；认证入口接收操作 ID，并在成功后返回 HAT，不要求先传入
-新的录入 HAT。因此不能将 Keymaster 绑定或 IRQ 检测描述成已实现认证。当前仍使用
-密码登录，不向 GNOME 注册无法完成录入和验证的指纹设备，也不读取或复制 Android 模板。
+后端不提供 libfprint `IDENTIFY`。QTEE 每次只选择一个 Linux 用户的分组，而
+libfprint 的识别图库可能跨用户，包括 fprintd 的录入查重，因此不能声称支持该能力。
+`fprintd` 的 `any` 验证请求会由它选择并提示一个已登记手指，再执行单手指 `VERIFY`；
+原生 `verify <uid> any` 则只在该 UID 已登记的手指范围内匹配，不提供跨用户识别。
 
 随后bde3普通重启发现，虽然modules-load文件已安装，旧modprobe黑名单仍使systemd把LPG记为deny-listed。已仅移除 `leds_qcom_lpg` 这一条，并让完整root stager与通用BSP使用同一份tracked modprobe配置。重新启动标准modules-load后插入LPG并出现三个接口，随后一次完整正常重启也已确认三个接口自动出现。当前记录在 `bde3-rgb-startup.txt` 与 `bde3-rgb-policy-fixed.txt`，不能用之前手动modprobe结果替代启动策略验证。

@@ -4,14 +4,14 @@
  *
  * Native Piano Goodix control client. The application interface follows the
  * factory libgf_ca/QSEECom calls; transport is Qualcomm's public MinkIPC API.
- * Device information, sensor initialization and Keymaster binding are
- * implemented. Enrollment and authentication still require their Goodix
- * command protocol and a libfprint backend.
+ * Linux profiles have their own Gatekeeper credential and template storage;
+ * factory Android credentials and fingerprint files are never opened.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
+#include <endian.h>
 #include <fcntl.h>
 #include <glob.h>
 #include <poll.h>
@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <sys/random.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -29,7 +31,10 @@
 #include <qcbor/qcbor_encode.h>
 #include <qcbor/qcbor_spiffy_decode.h>
 #include "piano-goodix-events.h"
+#include "piano-goodix-gatekeeper.h"
+#include "piano-goodix-operations.h"
 #include "piano-goodix-storage.h"
+#include "piano-goodix.h"
 
 #define FIRMWARE "/usr/lib/firmware/gfpia.elf"
 #define FIRMWARE_LIMIT (32U * 1024U * 1024U)
@@ -77,6 +82,7 @@ struct sensor_geometry {
 	uint32_t model_required;
 	uint8_t anti_spoof_required;
 	uint8_t anti_spoof_variant;
+	uint8_t enrollment_extended, interaction_policy;
 	int models_loaded;
 };
 
@@ -118,6 +124,8 @@ static int close_client(struct client *client)
 	}
 	if (client->controller >= 0)
 		close(client->controller);
+	if (client->shared)
+		explicit_bzero(client->shared, client->shared_size);
 	Object_RELEASE_IF(client->memory);
 	client->memory = Object_NULL;
 	Object_RELEASE_IF(client->app);
@@ -398,18 +406,14 @@ static int keymaster_native_command_strict(Object app, const void *request, size
 	return 0;
 }
 
-static int keymaster_sharing_init(struct client *client)
+static int open_keymaster(struct client *client, Object *output)
 {
 	const char name[] = "keymaster64";
 	Object opener = Object_NULL, environment = Object_NULL, app = Object_NULL;
-	uint32_t uid = 151, length, version = 0x200;
+	uint32_t uid = 151, version = 0x200;
 	uint32_t handshake[] = {0x207, 4, 5, 4, 5, 0};
-	uint32_t get = 0x220e, compute = 0x220f;
-	uint8_t response[512] = {0}, request[128] = {0}, parameters[64] = {0};
-	size_t actual = 0;
-	UsefulBufC seed = NULLUsefulBufC, nonce = NULLUsefulBufC, encoded;
-	QCBORDecodeContext decoder;
-	QCBOREncodeContext encoder;
+	uint8_t response[512] = {0};
+	size_t actual;
 	int result;
 	ObjectArg service[] = {
 		{ .bi = {&uid, sizeof(uid)} }, { .o = Object_NULL },
@@ -441,6 +445,29 @@ static int keymaster_sharing_init(struct client *client)
 	if (!result)
 		result = keymaster_native_command_strict(app, handshake, sizeof(handshake),
 						 response, sizeof(response), &actual);
+	if (!result) {
+		*output = app;
+		app = Object_NULL;
+	}
+done:
+	clear_sensitive(response, sizeof(response));
+	Object_RELEASE_IF(app);
+	Object_RELEASE_IF(environment);
+	Object_RELEASE_IF(opener);
+	return result;
+}
+
+static int keymaster_sharing_init(struct client *client)
+{
+	Object app = Object_NULL;
+	uint32_t length, get = 0x220e, compute = 0x220f;
+	uint8_t response[512] = {0}, request[128] = {0}, parameters[64] = {0};
+	size_t actual = 0;
+	UsefulBufC seed = NULLUsefulBufC, nonce = NULLUsefulBufC, encoded;
+	QCBORDecodeContext decoder;
+	QCBOREncodeContext encoder;
+	int result = open_keymaster(client, &app);
+
 	if (!result)
 		result = keymaster_native_command_strict(app, &get, sizeof(get),
 						 response, sizeof(response), &actual);
@@ -485,8 +512,6 @@ done:
 	clear_sensitive(request, sizeof(request));
 	clear_sensitive(parameters, sizeof(parameters));
 	Object_RELEASE_IF(app);
-	Object_RELEASE_IF(environment);
-	Object_RELEASE_IF(opener);
 	return result;
 }
 
@@ -718,6 +743,11 @@ static int initialize_sensor(struct client *client, struct sensor_geometry *geom
 	memcpy(&geometry->model_required, payload + 0x1ec, sizeof(uint32_t));
 	geometry->anti_spoof_required = payload[0x20d];
 	geometry->anti_spoof_variant = payload[0x212];
+	/* The factory copies device-info +0x70 into g_hal_config. Preserve the
+	 * actual extended-enrollment and interaction bytes before INIT replaces it.
+	 */
+	geometry->enrollment_extended = payload[0xd3];
+	geometry->interaction_policy = payload[0x20c];
 	/* Milan initialization, recovered from the factory HAL's sensor-type-5
 	 * function table. Empty OTP cache means read calibration from the real
 	 * sensor. No Android storage, user template or enrollment command is used.
@@ -753,27 +783,6 @@ static int initialize_sensor(struct client *client, struct sensor_geometry *geom
 	memset(client->shared, 0, client->shared_size);
 	/* Factory default interaction policy, without Android debug overrides. */
 	return sensor_command(client, 1109, 0xc0);
-}
-
-static int select_linux_group(struct client *client, uint32_t user_id)
-{
-	const char *parents[] = { "/var/lib/piano-goodix" };
-	char path[128];
-
-	for (size_t i = 0; i < sizeof(parents) / sizeof(parents[0]); i++) {
-		if (mkdir(parents[i], 0700) && errno != EEXIST)
-			return -errno;
-	}
-	snprintf(path, sizeof(path), "/var/lib/piano-goodix/%u", user_id);
-	if (mkdir(path, 0700) && errno != EEXIST)
-		return -errno;
-	/* The native profile is entirely on the Linux root filesystem.
-	 * No factory Android directory, mount or template is used.
-	 */
-	memset(client->shared, 0, client->shared_size);
-	memcpy((uint8_t *)client->shared + 0x6c, &user_id, sizeof(user_id));
-	memcpy((uint8_t *)client->shared + 0x70, path, strlen(path) + 1);
-	return sensor_command(client, 1014, 0x270);
 }
 
 static int enumerate_templates(struct client *client, uint32_t maximum,
@@ -895,42 +904,770 @@ cancel:
 	return result ? result : stopped;
 }
 
-int main(int argc, char **argv)
+/* The profile contains Linux finger names and opaque IDs, never templates or
+ * authentication tokens. A pending ID is written before 1012 so interruption
+ * between the secure save and local commit can be recovered in this group.
+ */
+struct linux_profile {
+	uint32_t linux_uid, group;
+	uint64_t sid;
+	uint32_t pending_finger, pending_id;
+	uint32_t templates[10];
+};
+
+struct profile_session {
+	struct client client;
+	struct sensor_geometry geometry;
+	struct goodix_storage *storage;
+	struct linux_profile profile;
+	Object keymaster;
+	int directory, gatekeeper_directory, hardware_lock;
+	char fpdata[128];
+};
+
+#define PROFILE_RECORD_BYTES 72U
+static const uint8_t profile_magic[8] = {'P', 'I', 'A', 'N', 'O', 'F', 'P', 1};
+
+static int private_directory(int parent, const char *name, int create)
+{
+	struct stat st;
+
+	if (create) {
+		if (mkdirat(parent, name, 0700)) {
+			if (errno != EEXIST)
+				return -errno;
+		} else if (fsync(parent))
+			return -errno;
+	}
+	int fd = openat(parent, name, O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	if (fstat(fd, &st) || st.st_uid != geteuid() || (st.st_mode & 0777) != 0700) {
+		close(fd);
+		return -EACCES;
+	}
+	return fd;
+}
+
+static uint32_t profile_word(const uint8_t *record, size_t offset)
+{
+	uint32_t value;
+
+	memcpy(&value, record + offset, sizeof(value));
+	return le32toh(value);
+}
+
+static void profile_put_word(uint8_t *record, size_t offset, uint32_t value)
+{
+	value = htole32(value);
+	memcpy(record + offset, &value, sizeof(value));
+}
+
+static int profile_load(int directory, struct linux_profile *profile)
+{
+	uint8_t record[PROFILE_RECORD_BYTES];
+	struct stat st;
+	uint64_t sid;
+	int fd = openat(directory, "profile", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+
+	if (fd < 0)
+		return -errno;
+	int result = 0;
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+	    st.st_uid != geteuid() || (st.st_mode & 0777) != 0600 ||
+	    st.st_size != sizeof(record)) {
+		result = -EACCES;
+		goto done;
+	}
+	ssize_t bytes;
+	do {
+		bytes = read(fd, record, sizeof(record));
+	} while (bytes < 0 && errno == EINTR);
+	if (bytes != sizeof(record)) {
+		result = bytes < 0 ? -errno : -EIO;
+		goto done;
+	}
+	if (memcmp(record, profile_magic, sizeof(profile_magic)) ||
+	    profile_word(record, 8) != profile->linux_uid ||
+	    profile_word(record, 12) != profile->group) {
+		result = -EBADMSG;
+		goto done;
+	}
+	memcpy(&sid, record + 16, sizeof(sid));
+	profile->sid = le64toh(sid);
+	profile->pending_finger = profile_word(record, 24);
+	profile->pending_id = profile_word(record, 28);
+	if (profile->pending_finger > 10 ||
+	    (!!profile->pending_finger != !!profile->pending_id)) {
+		result = -EBADMSG;
+		goto done;
+	}
+	for (size_t i = 0; i < 10; ++i) {
+		profile->templates[i] = profile_word(record, 32 + 4 * i);
+		if ((profile->templates[i] || profile->pending_id) && !profile->sid) {
+			result = -EBADMSG;
+			goto done;
+		}
+		for (size_t j = 0; j < i; ++j)
+			if (profile->templates[i] && profile->templates[i] == profile->templates[j]) {
+				result = -EBADMSG;
+				goto done;
+			}
+		if (profile->pending_id && profile->templates[i] == profile->pending_id &&
+		    profile->pending_finger != i + 1) {
+			result = -EBADMSG;
+			goto done;
+		}
+	}
+	if (profile->pending_finger && profile->templates[profile->pending_finger - 1] &&
+	    profile->templates[profile->pending_finger - 1] != profile->pending_id)
+		result = -EBADMSG;
+done:
+	close(fd);
+	return result;
+}
+
+static int profile_save(int directory, const struct linux_profile *profile)
+{
+	uint8_t record[PROFILE_RECORD_BYTES] = {0};
+	uint64_t suffix, sid = htole64(profile->sid);
+	char temporary[48];
+	int result = 0;
+
+	memcpy(record, profile_magic, sizeof(profile_magic));
+	profile_put_word(record, 8, profile->linux_uid);
+	profile_put_word(record, 12, profile->group);
+	memcpy(record + 16, &sid, sizeof(sid));
+	profile_put_word(record, 24, profile->pending_finger);
+	profile_put_word(record, 28, profile->pending_id);
+	for (size_t i = 0; i < 10; ++i)
+		profile_put_word(record, 32 + 4 * i, profile->templates[i]);
+	if (getrandom(&suffix, sizeof(suffix), 0) != sizeof(suffix))
+		return -EIO;
+	snprintf(temporary, sizeof(temporary), ".profile-%016llx",
+		 (unsigned long long)suffix);
+	int fd = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+				       O_CLOEXEC, 0600);
+	if (fd < 0)
+		return -errno;
+	for (size_t offset = 0; offset < sizeof(record);) {
+		ssize_t bytes = write(fd, record + offset, sizeof(record) - offset);
+		if (bytes < 0 && errno == EINTR)
+			continue;
+		if (bytes <= 0) {
+			result = bytes < 0 ? -errno : -EIO;
+			break;
+		}
+		offset += bytes;
+	}
+	if (!result && fsync(fd))
+		result = -errno;
+	close(fd);
+	if (!result && renameat(directory, temporary, directory, "profile"))
+		result = -errno;
+	if (!result && fsync(directory))
+		result = -errno;
+	if (result)
+		unlinkat(directory, temporary, 0);
+	return result;
+}
+
+static int profile_open(struct profile_session *session, uint32_t linux_uid, int create)
+{
+	char name[16];
+	int base, directory, result;
+
+	memset(session, 0, sizeof(*session));
+	session->directory = session->gatekeeper_directory = session->hardware_lock =
+		session->client.controller = -1;
+	session->profile.linux_uid = linux_uid;
+	result = goodix_gatekeeper_uid(linux_uid, &session->profile.group);
+	if (result)
+		return result;
+	if (geteuid())
+		return -EACCES;
+	int parent = open("/var/lib", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (parent < 0)
+		return -errno;
+	base = private_directory(parent, "piano-goodix", create);
+	close(parent);
+	if (base < 0)
+		return base;
+	/* One physical sensor and one pair of FS listeners serve every user.
+	 * Lock their existing parent directory before registering any listener.
+	 */
+	session->hardware_lock = base;
+	if (flock(base, LOCK_EX | LOCK_NB))
+		return errno == EWOULDBLOCK ? -EBUSY : -errno;
+	snprintf(name, sizeof(name), "%u", linux_uid);
+	directory = private_directory(base, name, create);
+	if (directory < 0)
+		return directory;
+	session->directory = directory;
+	result = profile_load(directory, &session->profile);
+	if (result == -ENOENT)
+		result = create ? 0 : -EUCLEAN;
+	if (result)
+		return result;
+	session->gatekeeper_directory = private_directory(directory, "gatekeeper", create);
+	if (session->gatekeeper_directory < 0)
+		return session->gatekeeper_directory == -ENOENT ? -EUCLEAN :
+			session->gatekeeper_directory;
+	int fpdata = private_directory(directory, "fpdata", create);
+	if (fpdata < 0)
+		return fpdata == -ENOENT ? -EUCLEAN : fpdata;
+	close(fpdata);
+	snprintf(session->fpdata, sizeof(session->fpdata), "/var/lib/piano-goodix/%u/fpdata",
+		 linux_uid);
+	return 0;
+}
+
+static int session_close(struct profile_session *session, int result)
+{
+	Object_RELEASE_IF(session->keymaster);
+	int closed = close_client(&session->client);
+	goodix_storage_close(session->storage);
+	if (session->gatekeeper_directory >= 0)
+		close(session->gatekeeper_directory);
+	if (session->directory >= 0)
+		close(session->directory);
+	if (session->hardware_lock >= 0)
+		close(session->hardware_lock);
+	clear_sensitive(&session->profile, sizeof(session->profile));
+	return result ? result : closed;
+}
+
+static int session_start(struct profile_session *session, int gatekeeper)
+{
+	struct client *client = &session->client;
+	int result = goodix_storage_open_profile(session->fpdata, gatekeeper, &session->storage);
+
+	if (!result)
+		result = open_client(client);
+	if (!result)
+		result = device_info(client, &session->geometry.sensor_type);
+	if (!result)
+		result = initialize_sensor(client, &session->geometry);
+	if (!result)
+		result = prepare_authentication(client);
+	if (result)
+		return result;
+	memset(client->shared, 0, client->shared_size);
+	memcpy((uint8_t *)client->shared + 0x6c, &session->profile.group, sizeof(uint32_t));
+	const char path[] = "/data/vendor_de/0/fpdata";
+	memcpy((uint8_t *)client->shared + 0x70, path, sizeof(path));
+	return sensor_command(client, 1014, 0x270);
+}
+
+static int profile_contains(const struct template_list *list, uint32_t group, uint32_t id)
+{
+	for (size_t i = 0; i < list->count; ++i)
+		if (list->entries[i].group == group && list->entries[i].id == id)
+			return 1;
+	return 0;
+}
+
+static int profile_reconcile_list(struct profile_session *session, const struct template_list *list)
+{
+	struct linux_profile *profile = &session->profile;
+	int changed = 0;
+
+	/* Unknown TA IDs are not exposed or removed. Only recover the exact ID
+	 * persisted before our own save, and prune stale Linux-owned mappings.
+	 */
+	if (profile->pending_finger) {
+		if (profile_contains(list, profile->group, profile->pending_id))
+			profile->templates[profile->pending_finger - 1] = profile->pending_id;
+		profile->pending_id = profile->pending_finger = 0;
+		changed = 1;
+	}
+	for (size_t i = 0; i < 10; ++i)
+		if (profile->templates[i] &&
+		    !profile_contains(list, profile->group, profile->templates[i])) {
+			profile->templates[i] = 0;
+			changed = 1;
+		}
+	return changed ? profile_save(session->directory, profile) : 0;
+}
+
+static int profile_reconcile(struct profile_session *session)
+{
+	struct template_list list = {0};
+	int result = enumerate_templates(&session->client, session->geometry.max_templates, &list);
+
+	return result ? result : profile_reconcile_list(session, &list);
+}
+
+static int grow_operation_buffer(struct client *client, size_t required)
+{
+	Object memory = Object_NULL;
+	void *shared;
+	size_t capacity;
+
+	if (client->shared_size >= required)
+		return 0;
+	if (MinkCom_getMemoryObject(client->root, required, &memory) ||
+	    MinkCom_getMemoryObjectInfo(memory, &shared, &capacity) || capacity < required) {
+		Object_RELEASE_IF(memory);
+		return -ENOMEM;
+	}
+	clear_sensitive(client->shared, client->shared_size);
+	Object_RELEASE_IF(client->memory);
+	client->memory = memory;
+	client->shared = shared;
+	client->shared_size = capacity;
+	return 0;
+}
+
+static int gatekeeper_command(void *context, const void *request, size_t request_bytes,
+			      uint8_t *response, size_t capacity, size_t *actual, int32_t *status)
+{
+	struct profile_session *session = context;
+	uint32_t opcode;
+	uint64_t uid;
+	QCBORDecodeContext decoder;
+
+	if (request_bytes < sizeof(opcode))
+		return -EMSGSIZE;
+	memcpy(&opcode, request, sizeof(opcode));
+	opcode = le32toh(opcode);
+	if (opcode != 0x21001 && opcode != 0x21002)
+		return -EPERM;
+	QCBORDecode_Init(&decoder, (UsefulBufC){(const uint8_t *)request + 4, request_bytes - 4},
+			 QCBOR_DECODE_MODE_NORMAL);
+	QCBORDecode_EnterMap(&decoder, NULL);
+	QCBORDecode_GetUInt64InMapN(&decoder, 3, &uid);
+	QCBORDecode_ExitMap(&decoder);
+	if (QCBORDecode_Finish(&decoder) || uid != session->profile.group ||
+	    (uid & 0xf0000000) != 0x40000000)
+		return -EPERM;
+	/* CBO carries no TA identity: allow its protected I/O only during the
+	 * selected Linux user's synchronous create/verify call. Sensor setup,
+	 * sampling, enumeration and deletion never keep this window open.
+	 */
+	goodix_storage_allow_rpmb(session->storage, 1);
+	int result = keymaster_native_command(session->keymaster, request, request_bytes,
+					     response, capacity, actual, status);
+	goodix_storage_allow_rpmb(session->storage, 0);
+	return result;
+}
+
+static int cancellation_requested(const struct piano_goodix_options *options)
+{
+	return options && ((options->cancelled && *options->cancelled) ||
+		(options->should_cancel && options->should_cancel(options->context)));
+}
+
+static int64_t monotonic_milliseconds(void)
+{
+	struct timespec time;
+
+	clock_gettime(CLOCK_MONOTONIC, &time);
+	return (int64_t)time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
+
+static void report_progress(const struct piano_goodix_options *options,
+			     enum piano_goodix_progress event, unsigned int remaining)
+{
+	if (options && options->progress)
+		options->progress(event, remaining, options->context);
+}
+
+static int run_operation(struct profile_session *session, struct goodix_operation *operation,
+			  unsigned int finger, unsigned int *matched_finger,
+			  const struct piano_goodix_options *options)
+{
+	unsigned int seconds = options && options->timeout_seconds ? options->timeout_seconds :
+		(finger && !matched_finger ? 120 : 30);
+	int64_t deadline = monotonic_milliseconds() + (int64_t)seconds * 1000;
+	struct pollfd irq = { .fd = session->client.controller, .events = POLLIN };
+	int interrupted_result = 0, failure = 0, wait_irq = 0;
+
+	for (;;) {
+		if (!interrupted_result && cancellation_requested(options))
+			interrupted_result = -ECANCELED;
+		if (!interrupted_result && monotonic_milliseconds() >= deadline)
+			interrupted_result = -ETIMEDOUT;
+		if (interrupted_result || failure) {
+			goodix_operation_cancel(operation);
+			wait_irq = 0;
+		}
+		if (wait_irq) {
+			int ready = poll(&irq, 1, 100);
+			if (ready < 0 && errno == EINTR)
+				continue;
+			if (ready < 0 || (ready && !(irq.revents & POLLIN))) {
+				failure = ready < 0 ? -errno : -EIO;
+				continue;
+			}
+			if (!ready)
+				continue;
+			uint32_t count;
+			if (read(irq.fd, &count, sizeof(count)) != sizeof(count)) {
+				failure = -EIO;
+				continue;
+			}
+			wait_irq = 0;
+		}
+		struct goodix_operation_sample sample;
+		int result = goodix_operation_step(operation, &sample);
+		if (result < 0) {
+			clear_sensitive(&sample, sizeof(sample));
+			/* Do not continue a failed exchange. The explicit cleanup resets
+			 * this session only; no template or global credential is removed.
+			 */
+			goodix_events_cancel(operation->events);
+			if (!matched_finger)
+				goodix_operation_post_enroll(operation->events);
+			return failure ? failure : result;
+		}
+		if (sample.kind == GOODIX_OPERATION_ENROLL_PROGRESS) {
+			if (!sample.remaining) {
+				session->profile.pending_finger = finger;
+				session->profile.pending_id = sample.template_id;
+				failure = profile_save(session->directory, &session->profile);
+			}
+			report_progress(options, PIANO_GOODIX_ENROLL_PROGRESS, sample.remaining);
+		} else if (sample.kind == GOODIX_OPERATION_TEMPLATE_SAVED) {
+			/* 1012 committed securely. Preserve the pending on-disk record
+			 * if this local atomic replacement fails; the next call recovers it.
+			 */
+			session->profile.templates[finger - 1] = sample.template_id;
+			session->profile.pending_finger = session->profile.pending_id = 0;
+			failure = profile_save(session->directory, &session->profile);
+		} else if (sample.kind == GOODIX_OPERATION_QUALITY_RETRY) {
+			report_progress(options, PIANO_GOODIX_RETRY, 0);
+		} else if (sample.kind == GOODIX_OPERATION_NOT_MATCH) {
+			report_progress(options, PIANO_GOODIX_NOT_MATCH, 0);
+			/* A completed negative match is one verification attempt. Run
+			 * the normal cancel exchange before returning the denial.
+			 */
+			interrupted_result = -EACCES;
+		} else if (sample.kind == GOODIX_OPERATION_ACQUIRED) {
+			/* Factory HAL emits acquired 1022/1023 for bits 1/2. */
+			if (sample.mask & 2)
+				report_progress(options, PIANO_GOODIX_FINGER_DOWN, 0);
+			if (sample.mask & 4)
+				report_progress(options, PIANO_GOODIX_FINGER_UP, 0);
+		}
+		if (result == GOODIX_OPERATION_COMPLETE) {
+			int complete = sample.kind == GOODIX_OPERATION_ENROLLED ||
+				sample.kind == GOODIX_OPERATION_AUTHENTICATED;
+			if (sample.kind == GOODIX_OPERATION_AUTHENTICATED && matched_finger) {
+				for (size_t i = 0; i < 10; ++i)
+					if (session->profile.templates[i] == sample.template_id)
+						*matched_finger = i + 1;
+				if (!*matched_finger)
+					failure = -EACCES;
+			}
+			clear_sensitive(&sample, sizeof(sample));
+			return failure ? failure : complete ? 0 : interrupted_result ? interrupted_result :
+				-ECANCELED;
+		}
+		clear_sensitive(&sample, sizeof(sample));
+		if (result == GOODIX_OPERATION_WAIT_IRQ) {
+			uint32_t enable = 1;
+			if (write(irq.fd, &enable, sizeof(enable)) != sizeof(enable))
+				failure = -EIO;
+			else
+				wait_irq = 1;
+		}
+	}
+}
+
+int piano_goodix_enroll(uint32_t linux_uid, unsigned int finger,
+			 const struct piano_goodix_options *options)
+{
+	struct profile_session session;
+	struct goodix_operation operation = {0};
+	struct goodix_gatekeeper_status status = {0};
+	uint8_t hat[GOODIX_GATEKEEPER_HAT_BYTES] = {0};
+	uint64_t challenge = 0, sid;
+	uint32_t gatekeeper_opcode = 0;
+	int started = 0;
+	const char *stage = "opening Linux profile";
+
+	if (!finger || finger > 10)
+		return -EINVAL;
+	if (cancellation_requested(options))
+		return -ECANCELED;
+	int result = profile_open(&session, linux_uid, 1);
+	if (result)
+		goto done;
+	stage = "initializing sensor and Keymaster binding";
+	result = session_start(&session, 1);
+	if (!result) {
+		stage = "enumerating Linux templates";
+		result = profile_reconcile(&session);
+	}
+	if (!result && session.profile.templates[finger - 1]) {
+		stage = "checking existing enrollment";
+		result = -EEXIST;
+	}
+	if (!result) {
+		stage = "opening native Keymaster";
+		result = open_keymaster(&session.client, &session.keymaster);
+	}
+	struct goodix_gatekeeper gatekeeper = { .command = gatekeeper_command, .context = &session };
+	if (!result) {
+		stage = "provisioning Linux Gatekeeper credential";
+		gatekeeper_opcode = 0x21001;
+		result = goodix_gatekeeper_create(&gatekeeper, session.gatekeeper_directory, linux_uid,
+						  &status);
+	}
+	if (!result) {
+		stage = "allocating enrollment buffer";
+		gatekeeper_opcode = 0;
+		result = grow_operation_buffer(&session.client, session.geometry.enrollment_extended ?
+			GOODIX_ENROLL_EVENT_BUFFER_BYTES : GOODIX_EVENT_BUFFER_BYTES);
+	}
+	struct goodix_events events = {
+		.command = sensor_command_status, .context = &session.client,
+		.buffer = session.client.shared, .buffer_size = session.client.shared_size,
+	};
+	if (!result) {
+		stage = "preparing enrollment event exchange";
+		result = goodix_events_start(&events);
+		started = !result;
+	}
+	if (!result) {
+		stage = "getting Goodix enrollment challenge";
+		result = goodix_operation_challenge(&events, &challenge);
+	}
+	if (!result) {
+		stage = "verifying Linux Gatekeeper credential";
+		gatekeeper_opcode = 0x21002;
+		result = goodix_gatekeeper_verify(&gatekeeper, session.gatekeeper_directory, linux_uid,
+						  challenge, hat, &status);
+	}
+	if (!result) {
+		stage = "saving Linux profile identity";
+		gatekeeper_opcode = 0;
+		memcpy(&sid, hat + 9, sizeof(sid));
+		if (session.profile.sid && session.profile.sid != sid)
+			result = -EACCES;
+		else {
+			session.profile.sid = sid;
+			result = profile_save(session.directory, &session.profile);
+		}
+	}
+	if (!result) {
+		stage = "preparing authorized enrollment";
+		result = goodix_operation_start_enroll(&operation, &events, session.profile.group, hat,
+			session.geometry.enrollment_extended ? GOODIX_ENROLL_PACKET_EXTENDED :
+			GOODIX_ENROLL_PACKET_NORMAL);
+	}
+	clear_sensitive(hat, sizeof(hat));
+	if (!result) {
+		stage = "capturing and saving fingerprint";
+		result = run_operation(&session, &operation, finger, NULL, options);
+	} else if (started) {
+		/* Do not invalidate PRE_ENROLL before the HAT is consumed. This
+		 * branch is only the failed preparation path, before 1007 was sent.
+		 */
+		goodix_events_cancel(&events);
+		if (challenge)
+			goodix_operation_post_enroll(&events);
+	}
+done:
+	if (result) {
+		fprintf(stderr, "Fingerprint enrollment failed while %s: error=%d\n", stage, result);
+		if (gatekeeper_opcode)
+			fprintf(stderr, "Gatekeeper command %#x: status=%d retry_ms=%u\n",
+				gatekeeper_opcode, status.value, status.retry_ms);
+	}
+	clear_sensitive(hat, sizeof(hat));
+	clear_sensitive(&operation, sizeof(operation));
+	return session_close(&session, result);
+}
+
+int piano_goodix_verify(uint32_t linux_uid, unsigned int finger,
+			 unsigned int *matched_finger, const struct piano_goodix_options *options)
+{
+	struct profile_session session;
+	struct goodix_operation operation = {0};
+	uint32_t allowed[10];
+	size_t count = 0;
+	uint64_t challenge;
+
+	if (finger > 10 || !matched_finger)
+		return -EINVAL;
+	*matched_finger = 0;
+	if (cancellation_requested(options))
+		return -ECANCELED;
+	int result = profile_open(&session, linux_uid, 0);
+	if (result)
+		goto done;
+	result = session_start(&session, 0);
+	if (!result)
+		result = profile_reconcile(&session);
+	if (result)
+		goto done;
+	for (size_t i = 0; i < 10; ++i)
+		if (session.profile.templates[i] && (!finger || finger == i + 1))
+			allowed[count++] = session.profile.templates[i];
+	if (!count) {
+		result = -ENOENT;
+		goto done;
+	}
+	if (getrandom(&challenge, sizeof(challenge), 0) != sizeof(challenge) || !challenge) {
+		result = -EIO;
+		goto done;
+	}
+	result = grow_operation_buffer(&session.client, GOODIX_EVENT_BUFFER_BYTES);
+	struct goodix_events events = {
+		.command = sensor_command_status, .context = &session.client,
+		.buffer = session.client.shared, .buffer_size = session.client.shared_size,
+	};
+	if (!result)
+		result = goodix_events_start(&events);
+	if (!result)
+		result = goodix_operation_start_authenticate(&operation, &events, session.profile.group,
+			session.profile.sid, challenge, allowed, count, session.geometry.interaction_policy);
+	if (!result)
+		result = run_operation(&session, &operation, finger, matched_finger, options);
+done:
+	clear_sensitive(&operation, sizeof(operation));
+	return session_close(&session, result);
+}
+
+int piano_goodix_list(uint32_t linux_uid, unsigned int fingers[10], size_t *count)
+{
+	struct profile_session session;
+
+	if (!fingers || !count)
+		return -EINVAL;
+	*count = 0;
+	memset(fingers, 0, 10 * sizeof(*fingers));
+	int result = profile_open(&session, linux_uid, 0);
+	if (result == -ENOENT)
+		return session_close(&session, 0);
+	if (!result)
+		result = session_start(&session, 0);
+	if (!result)
+		result = profile_reconcile(&session);
+	if (!result)
+		for (size_t i = 0; i < 10; ++i)
+			if (session.profile.templates[i])
+				fingers[(*count)++] = i + 1;
+	return session_close(&session, result);
+}
+
+int piano_goodix_delete(uint32_t linux_uid, unsigned int finger)
+{
+	struct profile_session session;
+	struct template_list remaining = {0};
+
+	if (!finger || finger > 10)
+		return -EINVAL;
+	int result = profile_open(&session, linux_uid, 0);
+	if (result)
+		goto done;
+	result = session_start(&session, 0);
+	if (!result)
+		result = profile_reconcile(&session);
+	uint32_t id = session.profile.templates[finger - 1];
+	if (!result && !id)
+		result = -ENOENT;
+	if (result)
+		goto done;
+	memset(session.client.shared, 0, session.client.shared_size);
+	memcpy((uint8_t *)session.client.shared + 0x6c, &session.profile.group, sizeof(uint32_t));
+	memcpy((uint8_t *)session.client.shared + 0x70, &id, sizeof(id));
+	result = sensor_command(&session.client, 1013, 0xcc);
+	if (!result)
+		result = enumerate_templates(&session.client, session.geometry.max_templates, &remaining);
+	/* 1013 +0xc8 is the remaining total, not a deletion count. Confirm the
+	 * selected Linux-owned ID is absent instead of interpreting that number.
+	 */
+	if (!result && profile_contains(&remaining, session.profile.group, id))
+		result = -EIO;
+	if (!result) {
+		session.profile.templates[finger - 1] = 0;
+		result = profile_save(session.directory, &session.profile);
+	}
+done:
+	return session_close(&session, result);
+}
+
+/* Reuse only the Linux Gatekeeper profile. This diagnostic never loads the
+ * Goodix TA or opens UIO. Protected-storage I/O needs the explicit UFS option;
+ * the original denial probe remains available without that capability.
+ */
+static int gatekeeper_storage_probe(uint32_t linux_uid, int ufs)
+{
+	struct profile_session session;
+	struct goodix_gatekeeper_status status = {0};
+	unsigned int requests = 0;
+	int result = profile_open(&session, linux_uid, 1);
+
+	if (!result)
+		result = ufs ? goodix_storage_open_rpmb_ufs(&session.storage) :
+			goodix_storage_open_rpmb_probe(&session.storage);
+	if (!result && (MinkCom_getRootEnvObject(&session.client.root) ||
+	    MinkCom_getClientEnvObject(session.client.root, &session.client.env)))
+		result = -EIO;
+	if (!result)
+		result = open_keymaster(&session.client, &session.keymaster);
+	struct goodix_gatekeeper gatekeeper = { .command = gatekeeper_command, .context = &session };
+	if (!result)
+		result = goodix_gatekeeper_create(&gatekeeper, session.gatekeeper_directory,
+						 linux_uid, &status);
+	if (session.storage)
+		requests = goodix_storage_rpmb_probe_requests(session.storage);
+	fprintf(stderr, "Gatekeeper RPMB %s probe: requests=%u status=%d retry_ms=%u error=%d\n",
+		ufs ? "UFS" : "denial", requests, status.value, status.retry_ms, result);
+	return session_close(&session, result) ? 1 : 0;
+}
+
+int piano_goodix_diagnostics(int argc, char **argv)
 {
 	struct client client = { .controller = -1 };
 	struct sensor_geometry geometry = {0};
-	struct template_list templates = {0};
 	struct goodix_storage *storage = NULL;
 	uint32_t sensor_type = 0;
 	int storage_probe = argc >= 2 && !strcmp(argv[1], "storage-probe");
 	int watch = argc >= 2 && !strcmp(argv[1], "watch");
-	int list = argc >= 2 && !strcmp(argv[1], "list");
 	int auth_ready = argc >= 2 && !strcmp(argv[1], "prepare-auth");
 	int initialize = argc >= 2 && (!strcmp(argv[1], "initialize") ||
-				       watch || list || auth_ready || storage_probe);
+				       watch || auth_ready || storage_probe);
 	unsigned int seconds = 30;
 	uint32_t user_id = 0;
 	int result;
 
 	if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--help"))) {
-		puts("Usage: piano-fingerprint-ctl info|initialize|prepare-auth|watch [seconds]|list <uid>\n"
+		puts("Usage: piano-fingerprint-ctl info|initialize|prepare-auth|watch [seconds]\n"
 		     "       piano-fingerprint-ctl storage-probe --state-dir <empty-directory> <group>\n"
+		     "       piano-fingerprint-ctl storage-probe --rpmb-deny <LinuxUID>\n"
+		     "       piano-fingerprint-ctl storage-probe --rpmb-ufs <LinuxUID>\n"
 		     "Query the real Goodix sensor through UIO and QTEE.\n"
 		     "initialize also reads the sensor's geometry and calibration.\n"
 		     "watch reports sensor event flags for 1-120 seconds (default 30), then cancels.\n"
-		     "list queries TA templates without file services.\n"
 		     "storage-probe serves restricted FS/GPFS in an explicit empty Linux directory,\n"
 		     "then initializes and selects a group; it does not enroll, remove or authenticate.\n"
 		     "prepare-auth initializes Keymaster sharing when needed and binds Goodix.\n"
-		     "Enrollment and authentication are not implemented yet.");
+		     "--rpmb-deny probes the private Linux Gatekeeper credential, refuses every RPMB\n"
+		     "request and stops before Goodix initialization or fingerprint sampling.\n"
+		     "--rpmb-ufs instead permits authenticated UFS RPMB reads/writes for that probe;\n"
+		     "use only after authorizing protected-storage access. It never programs a key.");
 		return 0;
+	}
+	if (storage_probe && argc == 4 &&
+	    (!strcmp(argv[2], "--rpmb-deny") || !strcmp(argv[2], "--rpmb-ufs"))) {
+		char *end;
+		errno = 0;
+		unsigned long value = strtoul(argv[3], &end, 10);
+		if (errno || !*argv[3] || *end || *argv[3] == '-' || value > UINT32_MAX) {
+			fputs("Linux UID must be an unsigned 32-bit ID.\n", stderr);
+			return 2;
+		}
+		return gatekeeper_storage_probe(value, !strcmp(argv[2], "--rpmb-ufs"));
 	}
 	if (storage_probe && (argc != 5 || strcmp(argv[2], "--state-dir"))) {
 		fputs("storage-probe requires --state-dir <empty-directory> <group>.\n", stderr);
 		return 2;
 	}
-	if (!storage_probe && ((list && argc != 3) ||
-	    (argc != 2 && !((watch || list) && argc == 3)) ||
+	if (!storage_probe && ((argc != 2 && !(watch && argc == 3)) ||
 	    (!initialize && strcmp(argv[1], "info")))) {
 		fputs("Use --help for supported operations.\n", stderr);
 		return 2;
@@ -944,9 +1681,9 @@ int main(int argc, char **argv)
 		}
 		seconds = value;
 	}
-	if (list || storage_probe) {
+	if (storage_probe) {
 		char *end;
-		const char *number = argv[storage_probe ? 4 : 2];
+		const char *number = argv[4];
 		errno = 0;
 		unsigned long value = strtoul(number, &end, 10);
 		if (errno || !*number || *end || *number == '-' || value >= UINT32_MAX) {
@@ -976,8 +1713,6 @@ int main(int argc, char **argv)
 		result = prepare_authentication(&client);
 	if (!result && watch)
 		result = watch_events(&client, seconds);
-	if (!result && list)
-		result = select_linux_group(&client, user_id);
 	if (!result && storage_probe) {
 		uint8_t *payload = client.shared;
 		const char path[] = "/data/vendor_de/0/fpdata";
@@ -986,25 +1721,15 @@ int main(int argc, char **argv)
 		memcpy(payload + 0x70, path, sizeof(path));
 		result = sensor_command(&client, 1014, 0x270);
 	}
-	if (!result && list)
-		result = enumerate_templates(&client, geometry.max_templates, &templates);
 	int closed = close_client(&client);
 	goodix_storage_close(storage);
 	if (!result)
 		result = closed;
 	if (!result && storage_probe)
-		puts("{\"storage_probe_ok\":true,\"authentication_supported\":false}");
-	else if (!result && list) {
-		printf("{\"user_id\":%u,\"template_count\":%zu,\"templates\":[",
-		       user_id, templates.count);
-		for (size_t i = 0; i < templates.count; i++)
-			printf("%s{\"group\":%u,\"id\":%u}", i ? "," : "",
-			       templates.entries[i].group, templates.entries[i].id);
-		puts("]}");
-	} else if (!result && auth_ready)
+		puts("{\"storage_probe_ok\":true}");
+	else if (!result && auth_ready)
 		puts("{\"sensor\":\"Goodix\",\"sensor_initialized\":true,"
-		     "\"keymaster_binding_ready\":true,\"enrollment_supported\":false,"
-		     "\"authentication_supported\":false}");
+		     "\"keymaster_binding_ready\":true}");
 	else if (!result && initialize)
 		printf("{\"sensor\":\"Goodix\",\"sensor_type\":%u,"
 		       "\"chip_type\":%u,\"max_templates\":%u,\"rows\":%u,\"columns\":%u,"

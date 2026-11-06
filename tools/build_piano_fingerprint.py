@@ -7,6 +7,18 @@ import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
+NATIVE = ROOT / 'linux/userspace/fingerprint'
+CORE_SOURCES = (
+    'piano-goodix-storage.c', 'piano-goodix-events.c',
+    'piano-goodix-gatekeeper.c', 'piano-goodix-operations.c',
+    'piano-goodix-rpmb.c', 'piano-goodix.c',
+)
+HEADERS = (
+    'piano-goodix-storage.h', 'piano-goodix-events.h',
+    'piano-goodix-gatekeeper.h', 'piano-goodix-operations.h',
+    'piano-goodix-rpmb.h', 'piano-goodix.h',
+)
+CLI_SOURCE = NATIVE / 'piano-goodix-cli.c'
 RUNTIME_PATHS = {
     'usr/local/sbin/piano-fingerprint-ctl',
     'usr/share/piano-provenance/fingerprint.json',
@@ -40,11 +52,8 @@ def source_inputs():
             patch_inputs[str(path.relative_to(ROOT))] = expected
     return {
         'config_sha256': digest(ROOT / 'config/fingerprint.json'),
-        'client_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix.c'),
-        'events_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix-events.c'),
-        'events_header_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix-events.h'),
-        'storage_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix-storage.c'),
-        'storage_header_sha256': digest(ROOT / 'linux/userspace/fingerprint/piano-goodix-storage.h'),
+        'native_sources': {name: digest(NATIVE / name)
+                           for name in (*CORE_SOURCES, *HEADERS, CLI_SOURCE.name)},
         'builder_sha256': digest(Path(__file__)),
         'firmware_manifest_sha256': digest(
             ROOT / 'vendor/firmware/hyperos4-fingerprint/manifest.json'),
@@ -108,9 +117,8 @@ def build(output, flags, emulator=None):
         *[qcbor / 'src' / name for name in (
             'UsefulBuf.c', 'qcbor_encode.c', 'qcbor_decode.c',
             'qcbor_err_to_str.c', 'ieee754.c')],
-        ROOT / 'linux/userspace/fingerprint/piano-goodix-storage.c',
-        ROOT / 'linux/userspace/fingerprint/piano-goodix-events.c',
-        ROOT / 'linux/userspace/fingerprint/piano-goodix.c',
+        *[NATIVE / name for name in CORE_SOURCES],
+        CLI_SOURCE,
     ]
     objects = []
     for index, original in enumerate(originals):
@@ -119,7 +127,7 @@ def build(output, flags, emulator=None):
                    *['-I' + str(p) for p in includes],
                    '-c', original, '-o', obj]
         # Imported Qualcomm sources retain their own warning policy.
-        if not original.is_relative_to(ROOT / 'linux/userspace/fingerprint'):
+        if not original.is_relative_to(NATIVE):
             command = [arg for arg in command if arg != '-Werror']
         subprocess.run(command, check=True)
         objects.append(obj)
@@ -140,13 +148,13 @@ def build(output, flags, emulator=None):
     record = {
         'inputs': inputs,
         'sources': cfg['sources'],
-        'client_source': 'linux/userspace/fingerprint/piano-goodix.c',
-        'client_sha256': digest(originals[-1]),
+        'client_source': str(CLI_SOURCE.relative_to(ROOT)),
+        'client_sha256': digest(CLI_SOURCE),
         'source_files': {str(p.relative_to(ROOT)): digest(p) for p in originals},
         'firmware': json.loads(
             (ROOT / 'vendor/firmware/hyperos4-fingerprint/manifest.json').read_text())['files'],
-        'operations': ['info', 'initialize', 'prepare-auth', 'watch', 'list', 'storage-probe'],
-        'enrollment_supported': False, 'authentication_supported': False,
+        'operations': ['info', 'initialize', 'prepare-auth', 'watch', 'list',
+                       'storage-probe', 'enroll', 'verify', 'delete'],
     }
     if source_inputs() != inputs:
         raise ValueError('Fingerprint sources changed during compilation')
