@@ -6,8 +6,9 @@
 
 ## 最终 DT 的配置
 
-原厂启动参数选择 `qcom,mdss_dsi_p81_35_02_0b_dualdsi_dsc_vid`。
-该节点启用 `mi,video-mode-multi-timing` 和
+原厂包含 `p81_35_02_0b` 和 `p81_42_02_0a` 两个 P81 面板节点。
+本机 Android 的启动参数实际选择
+`qcom,mdss_dsi_p81_42_02_0a_dualdsi_dsc_vid`。这些节点启用 `mi,video-mode-multi-timing` 和
 `qcom,mdss-dsi-pan-enable-dynamic-fps`，更新方式为
 `dfps_immediate_porch_mode_vfp`。
 
@@ -25,7 +26,9 @@ CSOT 时序切换命令选择 page 0x10、解锁，然后按 B2、B3 顺序写�
 | 90 Hz | 0x00 | 0x80 |
 
 `qcom,mdss-dsi-timing-switch-video-command-state` 为 `dsi_hs_mode`。
-BOE 的命令顺序相反，不能将 CSOT 顺序用于所有面板。
+两家面板的 timing-switch-video-command 都按 B2、B3 顺序写入。
+BOE 在 on-command 初始化段另有 B3、B2 的顺序，不能把初始化序列与
+运行中的时序切换命令混为一谈。
 
 ## 代码路径
 
@@ -40,6 +43,25 @@ BOE 的命令顺序相反，不能将 CSOT 顺序用于所有面板。
   的 VRR 提交流程等待视频进入 active 区域，提交新的显示数据，
   随后对 P81 发送该命令。退出 60 Hz 到非 120 Hz 模式还有独立的
   `DSI_CMD_SET_DISP_PEN_CLEAR` 和等待下一次垂直同步步骤。
+
+## Android 报告的能力
+
+同机原厂 `OS3.0.304.0.WPYMIXM` 的 DisplayManager 报告
+`hasArrSupport=false`。SurfaceFlinger 列出的 30、48、50、60、90、120、144 Hz
+七个模式均为 `vrrConfig=N/A`。高通 HWC 报告 video mode、`DynFPS:true`、
+`QSync:false`、`Qsync mode:0`；当前为 120 Hz，VFP 68、vtotal 2310。
+实际运行设备树中的两个 P81 节点均声明同一份七档 DFPS 列表，没有 QSync
+最低刷新率或连续 VRR 范围。
+
+这些信息确认原厂通过固定档位和 VFP 更新实施刷新率调节，不能把设置中的
+可变刷新率直接解读为 30–144 Hz 任意频率。系统级的 `vrr_config=true` 或
+`smartpen_vrr_fps` 属性也不能代替显示器实际报告的能力。
+[Android ARR](https://source.android.com/docs/core/graphics/arr) 本身使用离散
+VSync 步进，`vrrConfig=null` 则表示该模式没有启用标准 ARR。
+
+Linux 的固定档位使用普通 DRM/KMS 模式接口，不需要 `vrr_capable`。
+按交互、空闲和视频内容自动选档属于合成器策略；内核需要保证各档切换时
+正确同步双 DSI、面板命令及帧缓冲生命周期。
 
 ## Linux 对照
 
