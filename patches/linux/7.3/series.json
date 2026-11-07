@@ -4,8 +4,8 @@
   "kernel_version": "7.3.0",
   "base_commit": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
   "base_tree": "30fd2ef82912c26cf3a58ad0ba6afc375fa851ac",
-  "target_tree": "e2810111bc0e8cf2aea1cf24438aea92f4a9b668",
-  "original_target_commit": "fecc42d7c23e2253e03549d8e1860710935277aa",
+  "target_tree": "afba110f6acd0887b2d7646b0777739897487a85",
+  "original_target_commit": "462bbf80a8646aa0bd39b8d9e350ce0efadcbaf9",
   "source_url": "https://github.com/torvalds/linux.git",
   "patches": [
     {
@@ -279,6 +279,14 @@
       "original_parent": "1020655a351ef916ed2f37d91faed55bfc0996cd",
       "committer_date": "2026-11-07T07:32:36+08:00",
       "tree": "e2810111bc0e8cf2aea1cf24438aea92f4a9b668"
+    },
+    {
+      "file": "0035-media-camss-sm8750-pix-alignment.patch",
+      "sha256": "a8675c6a28f11a3d79786774c98de6a3a9df82be338b7a44fd123f208cec0ff5",
+      "original_commit": "462bbf80a8646aa0bd39b8d9e350ce0efadcbaf9",
+      "original_parent": "fecc42d7c23e2253e03549d8e1860710935277aa",
+      "committer_date": "2026-11-07T08:32:43+00:00",
+      "tree": "afba110f6acd0887b2d7646b0777739897487a85"
     }
   ],
   "provenance": {
