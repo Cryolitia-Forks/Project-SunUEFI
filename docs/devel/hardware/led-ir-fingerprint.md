@@ -1,12 +1,12 @@
 # Piano 的 RGB 灯、红外与侧指纹
 
-本页记录 RGB 通道、SPI 红外和 Goodix 侧指纹的原厂接口与 Linux 实现。原生指纹客户端已能持久录入和验证，标准 libfprint／fprintd 桌面链路正在接入。
+本页记录 RGB 通道、SPI 红外和 Goodix 侧指纹的原厂接口与 Linux 实现。指纹通过原生 QTEE 客户端和标准 libfprint／fprintd 接入 GNOME 与 PAM，支持 Linux 独立录入、持久保存和认证。
 
 | 功能 | 原厂接口 | 当前 Linux 缺口 |
 | --- | --- | --- |
 | RGB 通道 | PM8550 SID1 上的 `qcom,pm8350c-pwm`，SPMI LPG，通道 1/2/3 为 red/green/blue | 标准驱动和产品DT已有；补齐SDAM/LPG模块加载后已出现三个标准LED接口。发光、可见位置和用途尚待确认。 |
 | 红外发射 | SE15 / SPI `0x89c000` / CS0，`ir-spi`，Android 原始波形字符设备 | 已接入标准 SPI/LIRC、原厂波形量化与 MOSI 空闲处理；光学输出未验证。 |
-| 侧指纹 | Goodix，GPIO 控制与高通 QTEE 安全服务 | 原生录入、保存后重新打开验证及错误手指拒绝可用；标准 libfprint／fprintd 接入尚未完成。 |
+| 侧指纹 | Goodix，GPIO 控制与高通 QTEE 安全服务 | Linux 独立录入、持久验证和错误手指拒绝已接入标准 fprintd、GNOME 锁屏与 PAM。 |
 
 ## RGB 通道
 
@@ -331,7 +331,7 @@ RPMB 与 Android 共用，包含全局写计数器、启动记录和安全存储
 直接链接同一原生 API，提供录入、单手指验证、枚举、按 UID 删除和取消；
 后端的设备私有数据只保存 Linux UID 和手指名称。fprintd 管理标准用户记录，
 密封模板仍由设备端存储管理。
-fprintd／GNOME 的端到端接入尚未完成，不能把原生命令行验证视为桌面解锁已可用。
+GNOME 账户设置通过标准 fprintd 接口录入，锁屏认证使用标准 PAM 链路。
 
 后端不提供 libfprint `IDENTIFY`。QTEE 每次只选择一个 Linux 用户的分组，而
 libfprint 的识别图库可能跨用户，包括 fprintd 的录入查重，因此不能声称支持该能力。
