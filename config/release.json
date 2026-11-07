@@ -12,6 +12,7 @@
     "additional_dtb_overlays": [
       "linux/dts/piano-cma.dtso",
       "linux/dts/piano-pcie-interrupt-map.dtso",
+      "linux/dts/piano-pcie-clocks.dtso",
       "linux/dts/piano-usb-typec.dtso",
       "linux/dts/piano-ufs-mcq.dtso",
       "linux/dts/piano-dsp-resources.dtso",
