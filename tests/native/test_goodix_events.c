@@ -15,6 +15,7 @@ struct reply {
 	uint32_t request_phase, mask, operation, phase;
 	int32_t status;
 	int transport_error;
+	uint8_t mistaken_touch;
 };
 
 struct exchange {
@@ -61,6 +62,7 @@ static int command(void *context, uint32_t number, size_t bytes, int32_t *status
 	if (reply->request_phase == 1) {
 		assert(word(buffer, 0xa8) == 512);
 		assert(word(buffer, 0x2c5) == 0x02000000);
+		assert(buffer[0x79] == 0);
 		buffer[0x2f3] = 0x37;
 		buffer[0x5d14] = 0x59;
 	} else if (reply->request_phase == 8) {
@@ -89,6 +91,7 @@ static int command(void *context, uint32_t number, size_t bytes, int32_t *status
 	put_word(buffer, 0x6c, reply->mask);
 	put_word(buffer, 0x70, reply->operation);
 	put_word(buffer, 0x98, reply->phase);
+	buffer[0x79] = reply->mistaken_touch;
 	*status = reply->status;
 	return reply->transport_error;
 }
@@ -291,10 +294,10 @@ static int enrollment_command(void *context, uint32_t number, size_t bytes, int3
 
 static void classified_status(int32_t status, enum goodix_events_purpose purpose,
 			      uint32_t operation, uint32_t mask, int expected,
-			      enum goodix_event_outcome outcome)
+			      enum goodix_event_outcome outcome, uint8_t mistaken_touch)
 {
 	const struct reply reply = { .request_phase = 1, .mask = mask,
-		.operation = operation, .status = status };
+		.operation = operation, .status = status, .mistaken_touch = mistaken_touch };
 	struct exchange exchange = { .replies = &reply, .count = 1 };
 	struct goodix_events events = {
 		.command = command, .context = &exchange,
@@ -321,34 +324,42 @@ static void quality(void)
 
 	for (size_t i = 0; i < sizeof(recoverable) / sizeof(*recoverable); ++i) {
 		classified_status(recoverable[i], GOODIX_EVENTS_ENROLL, 0, 0x80, 0,
-			GOODIX_EVENT_QUALITY_RETRY);
+			GOODIX_EVENT_QUALITY_RETRY, 0);
 		classified_status(recoverable[i], GOODIX_EVENTS_AUTHENTICATE, 1, 0x80, 0,
-			GOODIX_EVENT_QUALITY_RETRY);
+			GOODIX_EVENT_QUALITY_RETRY, 0);
 		classified_status(recoverable[i], GOODIX_EVENTS_METADATA, 1, 0x80, -EREMOTEIO,
-			GOODIX_EVENT_ORDINARY);
+			GOODIX_EVENT_ORDINARY, 0);
 		classified_status(recoverable[i], GOODIX_EVENTS_AUTHENTICATE, 0, 0x80, -EREMOTEIO,
-			GOODIX_EVENT_ORDINARY);
+			GOODIX_EVENT_ORDINARY, 0);
 		classified_status(recoverable[i], GOODIX_EVENTS_ENROLL, 0, 2, -EREMOTEIO,
-			GOODIX_EVENT_ORDINARY);
+			GOODIX_EVENT_ORDINARY, 0);
 	}
 	for (size_t i = 0; i < sizeof(fatal) / sizeof(*fatal); ++i) {
 		classified_status(fatal[i], GOODIX_EVENTS_ENROLL, 0, 0x80, -EREMOTEIO,
-			GOODIX_EVENT_ORDINARY);
+			GOODIX_EVENT_ORDINARY, 1);
 		classified_status(fatal[i], GOODIX_EVENTS_AUTHENTICATE, 1, 0x80, -EREMOTEIO,
-			GOODIX_EVENT_ORDINARY);
+			GOODIX_EVENT_ORDINARY, 1);
 	}
 	for (int32_t status = 1006; status <= 1119; status += 113) {
 		classified_status(status, GOODIX_EVENTS_AUTHENTICATE, 1, 0x80, 0,
-			GOODIX_EVENT_NOT_MATCH);
+			GOODIX_EVENT_NOT_MATCH, 0);
+		classified_status(status, GOODIX_EVENTS_AUTHENTICATE, 2, 0x80, 0,
+			GOODIX_EVENT_QUALITY_RETRY, 1);
+		classified_status(status, GOODIX_EVENTS_AUTHENTICATE, 1, 0x80, 0,
+			GOODIX_EVENT_QUALITY_RETRY, 0x80);
 		classified_status(status, GOODIX_EVENTS_ENROLL, 0, 0x80, -EREMOTEIO,
-			GOODIX_EVENT_ORDINARY);
+			GOODIX_EVENT_ORDINARY, 1);
 		classified_status(status, GOODIX_EVENTS_METADATA, 1, 0x80, -EREMOTEIO,
-			GOODIX_EVENT_ORDINARY);
+			GOODIX_EVENT_ORDINARY, 1);
+		classified_status(status, GOODIX_EVENTS_AUTHENTICATE, 1, 2, -EREMOTEIO,
+			GOODIX_EVENT_ORDINARY, 1);
+		classified_status(status, GOODIX_EVENTS_AUTHENTICATE, 4, 0x80, -EREMOTEIO,
+			GOODIX_EVENT_ORDINARY, 1);
 	}
-	classified_status(1064, GOODIX_EVENTS_AUTHENTICATE, 1, 0x80, 1, GOODIX_EVENT_ORDINARY);
-	classified_status(1064, GOODIX_EVENTS_ENROLL, 1, 0x80, -EREMOTEIO, GOODIX_EVENT_ORDINARY);
+	classified_status(1064, GOODIX_EVENTS_AUTHENTICATE, 1, 0x80, 1, GOODIX_EVENT_ORDINARY, 0);
+	classified_status(1064, GOODIX_EVENTS_ENROLL, 1, 0x80, -EREMOTEIO, GOODIX_EVENT_ORDINARY, 0);
 	classified_status(1064, GOODIX_EVENTS_AUTHENTICATE, 4, 0x80, -EREMOTEIO,
-		GOODIX_EVENT_ORDINARY);
+		GOODIX_EVENT_ORDINARY, 0);
 
 	/* A bad extended frame does not become a remaining=0 enrollment result;
 	 * retain the factory phase-2 exchange until a genuinely successful reply.

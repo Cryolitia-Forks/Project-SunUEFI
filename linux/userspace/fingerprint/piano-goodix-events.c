@@ -190,16 +190,20 @@ int goodix_events_read(struct goodix_events *events, struct goodix_sensor_event 
 			event->outcome = GOODIX_EVENT_QUALITY_RETRY;
 		else if ((event->mask & GOODIX_IMAGE_RESULT) && authentication &&
 			 (status == 1006 || status == 1119))
-			/* Both jump to 0x42454 -> authenticate_not_match. */
-			event->outcome = GOODIX_EVENT_NOT_MATCH;
+			/* HAL 0x42454 -> authenticate_not_match reads byte +0x79
+			 * at 0x24c98: a mistaken touch emits acquired 1028 and keeps
+			 * the operation running instead of reporting a failed match.
+			 */
+			event->outcome = events->buffer[0x79] ? GOODIX_EVENT_QUALITY_RETRY :
+				GOODIX_EVENT_NOT_MATCH;
 		else {
 			fprintf(stderr, "Goodix command 1016 failed: application=%d\n", status);
 			events->state = GOODIX_EVENTS_FAILED;
 			return -EREMOTEIO;
 		}
-		fprintf(stderr, "Goodix capture: outcome=%s application=%d operation=%u phase=%u\n",
+		fprintf(stderr, "Goodix capture: outcome=%s application=%d operation=%u phase=%u mistaken-touch=%u\n",
 			event->outcome == GOODIX_EVENT_NOT_MATCH ? "not-match" : "quality-retry",
-			status, event->operation, event->phase);
+			status, event->operation, event->phase, events->buffer[0x79]);
 	}
 	/* HAL 0x42774..0x42834 completes image/FF authentication with UPDATE_CONFIG
 	 * (1109) and AUTHENTICATE_FINISH (1086). FIDO takes 0x424a0 -> 0x427cc and

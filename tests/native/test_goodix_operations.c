@@ -28,6 +28,7 @@ struct exchange {
 	unsigned int calls, irq_calls, cancels, starts, saves, finishes, posts;
 	int enrollment, extended;
 	int32_t result_status;
+	uint8_t mistaken_touch;
 	enum fault fault;
 	uint8_t enrollment_hat[GOODIX_OPERATION_HAT_BYTES];
 };
@@ -129,6 +130,8 @@ static int command(void *context, uint32_t number, size_t bytes, int32_t *status
 		assert(!"Unexpected command: no template deletion or global cleanup is allowed");
 	}
 	assert(exchange->starts == 1);
+	if (word(buffer, 0x98) == 1)
+		assert(buffer[0x79] == 0); /* Clear AUTH1010 and previous IRQ metadata. */
 	++exchange->irq_calls;
 	unsigned int index = exchange->irq_calls;
 
@@ -163,8 +166,10 @@ static int command(void *context, uint32_t number, size_t bytes, int32_t *status
 		token(buffer + 0x2ac, exchange->fault == WRONG_TYPE ? 1 : 2,
 		      CHALLENGE + (exchange->fault == WRONG_CHALLENGE),
 		      SID + (exchange->fault == WRONG_SID));
-	if (index == 2)
+	if (index == 2) {
 		*status = exchange->result_status;
+		buffer[0x79] = exchange->mistaken_touch;
+	}
 	return 0;
 }
 
@@ -381,6 +386,40 @@ static void retry_results(void)
 		assert(step(&operation, &sample) == GOODIX_OPERATION_COMPLETE);
 		assert(sample.kind == GOODIX_OPERATION_CANCELLED && !exchange.finishes);
 		free(exchange.buffer);
+	}
+	/* Factory authenticate_not_match emits only acquired 1028 for this
+	 * flag. A later genuine result still needs identity checks and finish.
+	 */
+	for (int32_t status = 1006; status <= 1119; status += 113) {
+		for (enum fault fault = NONE; fault <= WRONG_SID; ++fault) {
+			struct exchange exchange = { .result_status = status,
+				.mistaken_touch = 1, .fault = fault };
+			struct goodix_events events;
+			struct goodix_operation operation = {0};
+			struct goodix_operation_sample sample;
+			uint32_t allowed = TEMPLATE;
+
+			setup(&exchange, &events, 0, 0);
+			assert(!goodix_operation_start_authenticate(&operation, &events, GROUP, SID,
+				CHALLENGE, &allowed, 1, 1));
+			assert(step(&operation, &sample) == GOODIX_OPERATION_WAIT_IRQ);
+			assert(step(&operation, &sample) == GOODIX_OPERATION_CONTINUE);
+			assert(step(&operation, &sample) == GOODIX_OPERATION_WAIT_IRQ);
+			assert(sample.kind == GOODIX_OPERATION_QUALITY_RETRY);
+			assert(!sample.group && !sample.template_id && !exchange.finishes);
+			int result = step(&operation, &sample);
+			if (fault == NONE) {
+				assert(result == GOODIX_OPERATION_CONTINUE);
+				assert(!exchange.finishes);
+				assert(step(&operation, &sample) == GOODIX_OPERATION_CONTINUE);
+				assert(step(&operation, &sample) == GOODIX_OPERATION_COMPLETE);
+				assert(sample.kind == GOODIX_OPERATION_AUTHENTICATED);
+				assert(exchange.finishes == 1);
+			} else {
+				assert(result == -EACCES && !exchange.finishes);
+			}
+			free(exchange.buffer);
+		}
 	}
 	struct exchange exchange = { .result_status = 1011 };
 	struct goodix_events events;
