@@ -81,7 +81,7 @@
   "root_preservation": "Dynamic repack retains BOOT3/4 raw ARM64 GKI bytes, including custom GKI and compatible KernelSU code. Existing ramdisk and v4 GKI signature sections move after the enlarged kernel without byte changes; init_boot/vendor_boot/REC/vbmeta remain untouched. Accept EFI-signature or NOP code0 followed by the validated direct code1 branch. Missing/stale source AVB needs one physical confirmation; malformed extents or unsupported entry layouts are refused. Source hashes, lossless restore and readback are always checked; this is not a replacement CI kernel.",
   "qualification_scope": "Top-level qualification flags describe the legacy optional --require-ready interface; generic installation uses live layout, identity, source recheck and complete write/readback checks instead.",
   "installed_core_helper": {
-    "version": "0.5.2",
+    "version": "0.5.6",
     "installation": "Use the compatible current BOOT, with stock or custom GKI, for first installation; adopt identical core; upgrade validated previous core. Keep current GKI and Android data.",
     "verified_manager": "SukiSU",
     "webui_bridge_verified": true,
