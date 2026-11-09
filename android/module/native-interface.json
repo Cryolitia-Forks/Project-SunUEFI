@@ -81,7 +81,7 @@
   "root_preservation": "Dynamic repack retains the current raw ARM64 GKI bytes, including compatible KernelSU code, and leaves init_boot/vendor_boot/REC/vbmeta untouched. Unsupported current-BOOT layout or AVB metadata is refused; this is not a replacement CI kernel.",
   "qualification_scope": "Top-level qualification flags describe the legacy optional --require-ready interface; generic installation uses live layout, identity, source recheck and complete write/readback checks instead.",
   "installed_core_helper": {
-    "version": "0.5.2",
+    "version": "0.5.4",
     "installation": "Use supported current stock BOOT for first installation; adopt identical core; upgrade known validated previous core. Keep current GKI and Android data.",
     "verified_manager": "SukiSU",
     "webui_bridge_verified": true,
