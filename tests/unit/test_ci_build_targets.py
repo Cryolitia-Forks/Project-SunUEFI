@@ -10,6 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
 import ci_build_targets as targets
+from build.shared_products import FIRMWARE_INPUTS
 
 PRODUCTS = ['debian-gnome', 'debian-kde', 'debian-denial', 'nyarch-gnome',
             'arch-denial', 'steamos']
@@ -95,7 +96,7 @@ class CiBuildTargetsTests(unittest.TestCase):
             commit('remove product input')
             assert_changes(moved_in, 'linux/settings')
 
-    def test_workflow_path_filter_agrees_on_tracked_inputs(self):
+    def test_fork_workflow_covers_firmware_inputs(self):
         workflow = ROOT / '.github/workflows/build-products.yml'
         lines = workflow.read_text().splitlines()
         rules = []
@@ -116,10 +117,17 @@ class CiBuildTargetsTests(unittest.TestCase):
                     enabled = not rule.startswith('!')
             return enabled
 
-        tracked = subprocess.check_output(['git', '-C', ROOT, 'ls-files', '-z'], text=True)
-        tracked = [path for path in tracked.split('\0') if path]
-        self.assertEqual([path for path in tracked if included(path)],
-                         [path for path in tracked if targets.select([path])])
+        tracked = subprocess.check_output(
+            ['git', '-C', ROOT, 'ls-files', '-z', '--', *FIRMWARE_INPUTS], text=True)
+        self.assertEqual([path for path in tracked.split('\0') if path and not included(path)], [])
+        for path in ('containers/Dockerfile', 'config/build-container.json',
+                     'upstream/Mu-Silicium', 'upstream/simple-init', 'upstream/dtc'):
+            self.assertTrue(included(path), path)
+        for path in ('patches/linux/7.3/series.json', 'linux/dts/piano-tsens.dtso',
+                     '.github/workflows/_rootfs.yml', 'docs/user/install-from-artifact.md'):
+            self.assertFalse(included(path), path)
+        self.assertIn("      shared_matrix: '{\"kind\":[\"firmware\"]}'", lines)
+        self.assertIn('      module_only: true', lines)
 
     def test_host_checks_changes_alone_do_not_select_products(self):
         check_files = ['.github/workflows/host-checks.yml', 'tools/check_host.py',
